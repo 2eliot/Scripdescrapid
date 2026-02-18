@@ -333,7 +333,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         }""")
         await asyncio.sleep(0.3)  # Dejar que el JS de la página reaccione
 
-        # ── 9. Clic en botón final de canje ──────────────────────────
+        # ── 9. Clic en botón final de canje (interceptando /confirm) ──
         logger.info("Buscando botón de canje final...")
         redeem_btn = page.locator(
             '#btn-confirm,'
@@ -346,16 +346,28 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             'button.btn-redeem'
         ).first
 
+        confirm_ok = False
+
         if await redeem_btn.count() > 0:
-            # Forzar habilitación directa del botón encontrado
             await redeem_btn.evaluate("el => el.removeAttribute('disabled')")
-            logger.info("Haciendo clic en botón de canje final...")
-            await redeem_btn.click(timeout=10_000)
+            logger.info("Haciendo clic en botón de canje final (interceptando /confirm)...")
+            try:
+                async with page.expect_response(
+                    lambda r: "/confirm" in r.url or "/redeem" in r.url,
+                    timeout=15_000
+                ) as confirm_info:
+                    await redeem_btn.click(timeout=10_000)
+                confirm_resp = await confirm_info.value
+                logger.info("Respuesta /confirm: HTTP %s", confirm_resp.status)
+                if confirm_resp.status < 400:
+                    confirm_ok = True
+            except Exception as e:
+                logger.warning("No se interceptó /confirm: %s", e)
+                # Igual esperar por si la página cambió
         else:
-            # Fallback: hacer submit via JS del primer form visible
+            # Fallback: submit via JS
             logger.info("Botón no encontrado, intentando submit via JS...")
             submitted = await page.evaluate("""() => {
-                // Buscar botón por texto
                 const btns = [...document.querySelectorAll('button, input[type="submit"]')];
                 for (const b of btns) {
                     const txt = (b.textContent || b.value || '').toLowerCase();
@@ -366,14 +378,15 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                         return 'clicked: ' + txt.trim();
                     }
                 }
-                // Último recurso: submit del form
                 const form = document.querySelector('form[action*="confirm"]') || 
                              document.querySelector('form');
                 if (form) { form.submit(); return 'form.submit'; }
                 return null;
             }""")
             logger.info("Fallback submit result: %s", submitted)
-            if not submitted:
+            if submitted:
+                confirm_ok = True
+            else:
                 return RedeemResponse(
                     success=False,
                     message="No se encontró botón de canje final",
@@ -381,22 +394,39 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 )
 
         await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
 
-        # ── 9. Verificar resultado final ─────────────────────────────
+        # ── 10. Verificar resultado final ─────────────────────────────
         page_text = await page.inner_text("body")
         lower_text = page_text.lower()
-        logger.info("Resultado final (200 chars): %s", page_text[:200].replace("\n", " "))
+        logger.info("Resultado final (300 chars): %s", page_text[:300].replace("\n", " "))
+
+        # Indicadores de que el formulario sigue ahí (NO se canjeó)
+        still_on_form_keywords = [
+            "editar dados", "editar datos", "edit data",
+            "canjear ahora", "resgatar agora", "redeem now",
+            "verificar id", "verify id",
+            "insira seu pin", "ingrese su pin",
+        ]
+        form_still_visible = any(kw in lower_text for kw in still_on_form_keywords)
+        if form_still_visible:
+            logger.warning("Página sigue en formulario - canje NO se completó")
+            return RedeemResponse(
+                success=False,
+                message="Canje no completado: el formulario sigue visible (botón no funcionó)",
+                player_name=player_name,
+                details=page_text[:400].strip(),
+            )
 
         success_keywords = [
             "successfully redeemed", "canjeado con éxito",
             "resgatado com sucesso", "congratulations",
-            "éxito", "canjeo exitoso", "fue canjeado",
-            "resgatado", "sucesso", "parabéns",
+            "canjeo exitoso", "fue canjeado",
+            "parabéns", "felicidades",
         ]
         for kw in success_keywords:
             if kw.lower() in lower_text:
-                logger.info("¡Canje exitoso! Jugador: %s", player_name)
+                logger.info("¡Canje exitoso confirmado! Jugador: %s", player_name)
                 return RedeemResponse(
                     success=True,
                     message="PIN canjeado exitosamente",
@@ -404,19 +434,23 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     details=kw,
                 )
 
-        # Si tenemos player_name y no hay errores claros, asumir éxito
-        if player_name:
+        # Si /confirm respondió 200 y la página YA NO muestra el formulario → éxito
+        if confirm_ok and not form_still_visible:
+            logger.info("Canje exitoso (confirm HTTP OK + formulario desapareció). Jugador: %s", player_name)
             return RedeemResponse(
                 success=True,
-                message="PIN canjeado (sin confirmación explícita)",
+                message="PIN canjeado exitosamente",
                 player_name=player_name,
-                details=page_text[:300].strip(),
+                details="confirm HTTP 200 + form gone",
             )
 
+        # Si no hay confirmación clara → FALLO (no asumir éxito)
         snippet = page_text[:500].strip()
+        logger.warning("Resultado incierto, reportando como FALLO: %s", snippet[:200])
         return RedeemResponse(
             success=False,
-            message="Resultado incierto – revisa los detalles",
+            message="Resultado incierto – no se confirmó el canje",
+            player_name=player_name,
             details=snippet,
         )
 
