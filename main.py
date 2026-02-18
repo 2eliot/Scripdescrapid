@@ -316,30 +316,28 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
-        # ── 8. Marcar TODOS los checkboxes + habilitar botones via JS ──
-        logger.info("Marcando checkboxes de términos y habilitando botones...")
-        await page.evaluate("""() => {
-            // Marcar TODOS los checkboxes no marcados (privacy, terms, etc.)
-            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                if (!cb.checked) {
-                    cb.checked = true;
-                    cb.dispatchEvent(new Event('change', {bubbles: true}));
-                    cb.dispatchEvent(new Event('click', {bubbles: true}));
-                }
-            });
-            // Habilitar TODOS los botones disabled
-            document.querySelectorAll('button[disabled], input[type="submit"][disabled]')
-                .forEach(b => b.removeAttribute('disabled'));
-        }""")
-        await asyncio.sleep(0.3)  # Dejar que el JS de la página reaccione
+        # ── 8. Marcar checkboxes con Playwright TRUSTED click ──────────
+        # JS checkbox.checked=true NO activa los handlers del framework.
+        # Necesitamos click real de Playwright para que el form acepte los términos.
+        logger.info("Marcando checkboxes con Playwright (trusted click)...")
+        all_checkboxes = page.locator('input[type="checkbox"]')
+        cb_count = await all_checkboxes.count()
+        for i in range(cb_count):
+            cb = all_checkboxes.nth(i)
+            try:
+                if await cb.is_visible() and not await cb.is_checked():
+                    await cb.click(timeout=3000)
+                    logger.info("Checkbox %d marcado via Playwright", i)
+            except Exception as e:
+                logger.warning("Checkbox %d falló: %s", i, e)
+
+        await asyncio.sleep(0.5)
 
         # ── 9. Clic en botón final de canje ──────────────────────────
-        # El botón real tiene id="btn-redeem". Usamos Playwright click (trusted)
-        # porque JS el.click() no dispara reCAPTCHA v3 ni los handlers del form.
-        # Primero: habilitar el botón via JS, luego: click real con Playwright.
         logger.info("Habilitando y buscando botón de canje final...")
 
         confirm_ok = False
+        confirm_body = ""
 
         # Habilitar btn-redeem via JS
         await page.evaluate("""() => {
@@ -347,15 +345,18 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             if (btn) btn.removeAttribute('disabled');
         }""")
 
-        # Intentar click con Playwright en #btn-redeem (trusted click)
+        # Capturar URL antes del click para detectar navegación
+        url_before = page.url
+
+        # Click con Playwright en #btn-redeem (trusted click)
         redeem_btn = page.locator("#btn-redeem")
-        confirm_body = ""
 
         if await redeem_btn.count() > 0 and await redeem_btn.is_visible():
             logger.info("Haciendo clic Playwright en #btn-redeem (trusted)...")
             try:
+                # Esperar navegación O respuesta AJAX
                 async with page.expect_response(
-                    lambda r: "/confirm" in r.url or "/redeem" in r.url,
+                    lambda r: "/confirm" in r.url,
                     timeout=15_000
                 ) as confirm_info:
                     await redeem_btn.click(timeout=10_000)
@@ -363,15 +364,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 logger.info("Respuesta /confirm: HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
                 try:
                     confirm_body = await confirm_resp.text()
-                    logger.info("Body /confirm (300 chars): %s", confirm_body[:300].replace("\n", " "))
-                except Exception:
-                    pass
+                    logger.info("Body /confirm (500 chars): %s", confirm_body[:500].replace("\n", " "))
+                except Exception as te:
+                    logger.warning("No se pudo leer body de /confirm: %s", te)
                 if confirm_resp.status < 400:
                     confirm_ok = True
             except Exception as e:
-                logger.warning("Click #btn-redeem o /confirm falló: %s", e)
+                logger.warning("Click #btn-redeem o intercept /confirm falló: %s", e)
         else:
-            # Fallback: buscar botón visible por texto y hacer click Playwright
             logger.info("#btn-redeem no visible, buscando por texto...")
             keywords = ["Resgatar", "Canjear", "Redeem"]
             clicked = False
@@ -396,14 +396,15 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # Esperar navegación o cambio de página
         try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
+            await page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
         await asyncio.sleep(2)
 
-        # Capturar URL actual (puede haber cambiado después del submit)
-        current_url = page.url
-        logger.info("URL actual después del canje: %s", current_url)
+        # Capturar URL actual
+        url_after = page.url
+        logger.info("URL antes: %s → después: %s", url_before, url_after)
+        url_changed = url_after != url_before
 
         # ── 10. Verificar resultado final ─────────────────────────────
         page_text = await page.inner_text("body")
