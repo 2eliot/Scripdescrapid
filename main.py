@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 _playwright = None
 _browser: Browser | None = None
 
-REDEEM_URL = "https://redeem.hype.games/client/en-US/redeem"
-TIMEOUT_MS = 15_000  # espera máxima por acción
+REDEEM_URL = "https://redeem.hype.games/client/es-MX/redeem"
+TIMEOUT_MS = 30_000  # espera máxima por acción
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +101,13 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         await pin_input.wait_for(state="visible", timeout=TIMEOUT_MS)
         await pin_input.fill(data.pin_key)
 
-        # Clic en botón "CANJEAR"
-        logger.info("Haciendo clic en CANJEAR...")
-        canjear_btn = page.locator('button:has-text("CANJEAR")').first
+        # Clic en botón "CANJEAR" / "REDEEM" / "RESGATAR"
+        logger.info("Haciendo clic en botón de canje...")
+        canjear_btn = page.locator(
+            'button:has-text("CANJEAR"),'
+            'button:has-text("REDEEM"),'
+            'button:has-text("RESGATAR")'
+        ).first
         await canjear_btn.wait_for(state="visible", timeout=TIMEOUT_MS)
         await canjear_btn.click()
 
@@ -131,8 +135,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     details=f"El sitio devolvió un error relacionado con: '{kw}'",
                 )
 
-        # Verificar que el formulario apareció (buscando "Nombre Completo")
-        if "nombre completo" not in lower_text:
+        # Verificar que el formulario apareció
+        form_keywords = ["nombre completo", "full name", "nome completo"]
+        if not any(kw in lower_text for kw in form_keywords):
             snippet = page_text[:500].strip()
             return RedeemResponse(
                 success=False,
@@ -205,9 +210,13 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             if not is_checked:
                 await checkbox.check()
 
-        # ── 6. Clic en "VERIFICAR ID" ──────────────────────────────────
+        # ── 6. Clic en "VERIFICAR ID" / "VERIFY ID" ─────────────────────
         logger.info("Haciendo clic en VERIFICAR ID...")
-        verify_btn = page.locator('button:has-text("VERIFICAR ID")').first
+        verify_btn = page.locator(
+            'button:has-text("VERIFICAR ID"),'
+            'button:has-text("VERIFY ID"),'
+            'button:has-text("VERIFICAR")'
+        ).first
         await verify_btn.wait_for(state="visible", timeout=TIMEOUT_MS)
         await verify_btn.click()
 
@@ -297,11 +306,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         else:
             logger.warning("Marcador 'ID verificado' no encontrado en la página")
 
-        # ── 9. Clic en "¡CANJEAR AHORA!" ─────────────────────────────
-        logger.info("Haciendo clic en ¡CANJEAR AHORA!...")
+        # ── 9. Clic en "¡CANJEAR AHORA!" / "REDEEM NOW" ──────────────
+        logger.info("Haciendo clic en CANJEAR AHORA...")
         redeem_btn = page.locator(
             'button:has-text("CANJEAR AHORA"),'
-            'a:has-text("CANJEAR AHORA")'
+            'button:has-text("REDEEM NOW"),'
+            'button:has-text("RESGATAR AGORA"),'
+            'a:has-text("CANJEAR AHORA"),'
+            'a:has-text("REDEEM NOW")'
         ).first
         await redeem_btn.wait_for(state="visible", timeout=TIMEOUT_MS)
         await redeem_btn.click()
