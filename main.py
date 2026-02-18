@@ -276,8 +276,16 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Interceptamos esa respuesta para obtener el player_name directamente
         player_name = None
 
+        # Forzar habilitación del botón verify (el JS de la página lo deja disabled
+        # si los eventos de validación no se dispararon correctamente con el fill via JS)
+        await page.evaluate("""() => {
+            const btns = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
+            btns.forEach(b => b.removeAttribute('disabled'));
+        }""")
+
         logger.info("Buscando botón de verificar ID...")
         verify_btn = page.locator(
+            '#btn-verify,'
             'button:has-text("Verificar ID"),'
             'button:has-text("Verify ID"),'
             'button:has-text("Verificar Id"),'
@@ -290,7 +298,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             async with page.expect_response(
                 lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
             ) as response_info:
-                await verify_btn.click()
+                await verify_btn.click(timeout=5000)
 
             try:
                 resp = await response_info.value
@@ -316,21 +324,25 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
         # ── 8. Clic en botón final de canje ──────────────────────────
-        # El form tiene action="/confirm". El botón submit puede tener
-        # textos: "Resgatar Agora", "Canjear Ahora", "Redeem Now", "Confirmar"
+        # Forzar habilitación de todos los botones de submit (pueden estar disabled)
+        await page.evaluate("""() => {
+            document.querySelectorAll('button[disabled], input[type="submit"][disabled]')
+                .forEach(b => b.removeAttribute('disabled'));
+        }""")
+
         logger.info("Buscando botón de canje final...")
         redeem_btn = page.locator(
+            '#btn-confirm,'
             'button:has-text("Resgatar"),'
             'button:has-text("Canjear"),'
             'button:has-text("Redeem"),'
             'button:has-text("Confirmar"),'
-            'form[action="/confirm"] button[type="submit"],'
-            '#btn-confirm'
+            'form[action="/confirm"] button[type="submit"]'
         ).first
 
         if await redeem_btn.count() > 0:
             logger.info("Haciendo clic en botón de canje final...")
-            await redeem_btn.click()
+            await redeem_btn.click(timeout=5000)
         else:
             # Fallback: submit del form de confirmación
             logger.info("Buscando form[action=/confirm] para submit...")
