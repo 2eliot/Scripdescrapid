@@ -376,18 +376,17 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Capturar URL antes del click para detectar navegación
         url_before = page.url
 
-        # Click con Playwright en #btn-redeem (trusted click)
+        # === Intento 1: Click Playwright en #btn-redeem ===
         redeem_btn = page.locator("#btn-redeem")
 
         if await redeem_btn.count() > 0 and await redeem_btn.is_visible():
-            logger.info("Haciendo clic Playwright en #btn-redeem (trusted)...")
+            logger.info("Intento 1: Clic Playwright en #btn-redeem...")
             try:
-                # Esperar navegación O respuesta AJAX
                 async with page.expect_response(
                     lambda r: "/confirm" in r.url,
-                    timeout=15_000
+                    timeout=10_000
                 ) as confirm_info:
-                    await redeem_btn.click(timeout=10_000)
+                    await redeem_btn.click(timeout=5_000)
                 confirm_resp = await confirm_info.value
                 logger.info("Respuesta /confirm: HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
                 try:
@@ -398,29 +397,88 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 if confirm_resp.status < 400:
                     confirm_ok = True
             except Exception as e:
-                logger.warning("Click #btn-redeem o intercept /confirm falló: %s", e)
-        else:
-            logger.info("#btn-redeem no visible, buscando por texto...")
-            keywords = ["Resgatar", "Canjear", "Redeem"]
-            clicked = False
-            for kw in keywords:
-                btn = page.locator(f'button:visible:has-text("{kw}")').first
-                if await btn.count() > 0:
-                    await btn.evaluate("el => el.removeAttribute('disabled')")
-                    logger.info("Haciendo clic Playwright en botón '%s'...", kw)
-                    try:
-                        await btn.click(timeout=10_000)
-                        confirm_ok = True
-                        clicked = True
-                    except Exception as e:
-                        logger.warning("Click en '%s' falló: %s", kw, e)
-                    break
-            if not clicked:
-                return RedeemResponse(
-                    success=False,
-                    message="No se encontró botón de canje final visible",
-                    details=page_text[:300],
-                )
+                logger.warning("Intento 1 falló (timeout /confirm): %s", e)
+
+        # === Intento 2: JS submit con reCAPTCHA token fresco ===
+        if not confirm_ok and not confirm_body:
+            logger.info("Intento 2: Submit via JS con reCAPTCHA token fresco...")
+            try:
+                async with page.expect_response(
+                    lambda r: "/confirm" in r.url,
+                    timeout=15_000
+                ) as confirm_info:
+                    js_result = await page.evaluate("""() => {
+                        return new Promise((resolve) => {
+                            // Buscar el sitekey de reCAPTCHA
+                            const recaptchaEl = document.querySelector('[data-sitekey]');
+                            const siteKey = recaptchaEl ? recaptchaEl.getAttribute('data-sitekey') : null;
+
+                            if (window.grecaptcha && siteKey) {
+                                // Obtener token fresco de reCAPTCHA v3
+                                window.grecaptcha.execute(siteKey, {action: 'confirm'}).then(token => {
+                                    // Insertar token en el form
+                                    let tokenInput = document.querySelector('input[name="g-recaptcha-response"]') ||
+                                                     document.querySelector('#g-recaptcha-response');
+                                    if (!tokenInput) {
+                                        tokenInput = document.createElement('input');
+                                        tokenInput.type = 'hidden';
+                                        tokenInput.name = 'g-recaptcha-response';
+                                        const form = document.querySelector('form') || document.querySelector('.card.back form') || document.body;
+                                        form.appendChild(tokenInput);
+                                    }
+                                    tokenInput.value = token;
+
+                                    // Hacer click en el botón (ahora con token válido)
+                                    const btn = document.querySelector('#btn-redeem');
+                                    if (btn) {
+                                        btn.removeAttribute('disabled');
+                                        btn.click();
+                                        resolve('clicked_with_token');
+                                    } else {
+                                        resolve('no_btn');
+                                    }
+                                }).catch(err => {
+                                    resolve('recaptcha_error: ' + err.message);
+                                });
+                            } else if (window.grecaptcha && window.grecaptcha.execute) {
+                                // Intentar sin sitekey (puede ser reCAPTCHA v2 invisible)
+                                try {
+                                    window.grecaptcha.execute();
+                                    resolve('executed_v2');
+                                } catch(e) {
+                                    // Sin reCAPTCHA, click directo
+                                    const btn = document.querySelector('#btn-redeem');
+                                    if (btn) { btn.click(); resolve('clicked_no_recaptcha'); }
+                                    else { resolve('no_btn_no_recaptcha'); }
+                                }
+                            } else {
+                                const btn = document.querySelector('#btn-redeem');
+                                if (btn) { btn.click(); resolve('clicked_no_grecaptcha'); }
+                                else { resolve('no_btn_no_grecaptcha'); }
+                            }
+                        });
+                    }""")
+                    logger.info("JS submit result: %s", js_result)
+                confirm_resp = await confirm_info.value
+                logger.info("Respuesta /confirm (JS): HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
+                try:
+                    confirm_body = await confirm_resp.text()
+                    logger.info("Body /confirm (JS) (500 chars): %s", confirm_body[:500].replace("\n", " "))
+                except Exception as te:
+                    logger.warning("No se pudo leer body de /confirm (JS): %s", te)
+                if confirm_resp.status < 400:
+                    confirm_ok = True
+            except Exception as e:
+                logger.warning("Intento 2 (JS submit) falló: %s", e)
+
+        if not confirm_ok and not confirm_body:
+            logger.warning("Ambos intentos de submit fallaron")
+            return RedeemResponse(
+                success=False,
+                message="No se pudo enviar el formulario de canje",
+                player_name=player_name,
+                details="Ambos intentos (Playwright click + JS submit con reCAPTCHA) fallaron",
+            )
 
         # Esperar navegación o cambio de página
         try:
