@@ -24,6 +24,41 @@ _redeem_lock = asyncio.Lock()  # Serializar canjes (1 a la vez)
 REDEEM_URL = "https://redeem.hype.games/"
 TIMEOUT_MS = 30_000
 
+BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+
+
+async def _ensure_browser():
+    """Garantiza que el browser esté vivo. Lo reinicia si crasheó."""
+    global _playwright, _browser
+    try:
+        if _browser and _browser.is_connected():
+            return
+    except Exception:
+        pass
+    logger.warning("Browser caído, reiniciando...")
+    # Limpiar
+    try:
+        if _browser:
+            await _browser.close()
+    except Exception:
+        pass
+    try:
+        if _playwright:
+            await _playwright.stop()
+    except Exception:
+        pass
+    # Re-lanzar
+    _playwright = await async_playwright().start()
+    _browser = await _playwright.chromium.launch(
+        headless=True, args=BROWSER_ARGS
+    )
+    logger.info("Browser reiniciado ✓")
+
 
 # ---------------------------------------------------------------------------
 # Ciclo de vida
@@ -34,13 +69,7 @@ async def lifespan(app: FastAPI):
     _redeem_lock = asyncio.Lock()
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
+        headless=True, args=BROWSER_ARGS
     )
     logger.info("Navegador Chromium pre-lanzado y listo ✓")
     yield
@@ -85,7 +114,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
     ctx: BrowserContext | None = None
     start = time.time()
     try:
-        assert _browser is not None, "Navegador no inicializado"
+        await _ensure_browser()
         ctx = await _browser.new_context(
             viewport={"width": 1280, "height": 720},
             locale="pt-BR",
