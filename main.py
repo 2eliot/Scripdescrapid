@@ -349,6 +349,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # Intentar click con Playwright en #btn-redeem (trusted click)
         redeem_btn = page.locator("#btn-redeem")
+        confirm_body = ""
+
         if await redeem_btn.count() > 0 and await redeem_btn.is_visible():
             logger.info("Haciendo clic Playwright en #btn-redeem (trusted)...")
             try:
@@ -358,7 +360,12 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 ) as confirm_info:
                     await redeem_btn.click(timeout=10_000)
                 confirm_resp = await confirm_info.value
-                logger.info("Respuesta /confirm: HTTP %s", confirm_resp.status)
+                logger.info("Respuesta /confirm: HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
+                try:
+                    confirm_body = await confirm_resp.text()
+                    logger.info("Body /confirm (300 chars): %s", confirm_body[:300].replace("\n", " "))
+                except Exception:
+                    pass
                 if confirm_resp.status < 400:
                     confirm_ok = True
             except Exception as e:
@@ -387,40 +394,35 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     details=page_text[:300],
                 )
 
-        await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+        # Esperar navegación o cambio de página
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
         await asyncio.sleep(2)
+
+        # Capturar URL actual (puede haber cambiado después del submit)
+        current_url = page.url
+        logger.info("URL actual después del canje: %s", current_url)
 
         # ── 10. Verificar resultado final ─────────────────────────────
         page_text = await page.inner_text("body")
         lower_text = page_text.lower()
         logger.info("Resultado final (300 chars): %s", page_text[:300].replace("\n", " "))
 
-        # Indicadores de que el formulario sigue ahí (NO se canjeó)
-        still_on_form_keywords = [
-            "editar dados", "editar datos", "edit data",
-            "canjear ahora", "resgatar agora", "redeem now",
-            "verificar id", "verify id",
-            "insira seu pin", "ingrese su pin",
-        ]
-        form_still_visible = any(kw in lower_text for kw in still_on_form_keywords)
-        if form_still_visible:
-            logger.warning("Página sigue en formulario - canje NO se completó")
-            return RedeemResponse(
-                success=False,
-                message="Canje no completado: el formulario sigue visible (botón no funcionó)",
-                player_name=player_name,
-                details=page_text[:400].strip(),
-            )
+        # Combinar texto de página + body de /confirm para buscar éxito
+        combined_text = (lower_text + " " + confirm_body.lower()).strip()
 
         success_keywords = [
             "successfully redeemed", "canjeado con éxito",
             "resgatado com sucesso", "congratulations",
             "canjeo exitoso", "fue canjeado",
             "parabéns", "felicidades",
+            "your order has been", "pedido foi",
         ]
         for kw in success_keywords:
-            if kw.lower() in lower_text:
-                logger.info("¡Canje exitoso confirmado! Jugador: %s", player_name)
+            if kw in combined_text:
+                logger.info("¡Canje exitoso confirmado! keyword='%s' Jugador: %s", kw, player_name)
                 return RedeemResponse(
                     success=True,
                     message="PIN canjeado exitosamente",
@@ -428,17 +430,42 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     details=kw,
                 )
 
-        # Si /confirm respondió 200 y la página YA NO muestra el formulario → éxito
-        if confirm_ok and not form_still_visible:
-            logger.info("Canje exitoso (confirm HTTP OK + formulario desapareció). Jugador: %s", player_name)
+        # Si /confirm respondió 200, verificar su body para errores
+        if confirm_ok and confirm_body:
+            confirm_lower = confirm_body.lower()
+            # Si el body de /confirm contiene error claro
+            error_in_confirm = any(e in confirm_lower for e in [
+                "error", "failed", "invalid", "expired", "falhou", "falló"
+            ])
+            if not error_in_confirm:
+                # /confirm HTTP 200, sin errores en body → probablemente éxito
+                logger.info("Canje exitoso (/confirm HTTP 200, sin errores en body). Jugador: %s", player_name)
+                return RedeemResponse(
+                    success=True,
+                    message="PIN canjeado exitosamente",
+                    player_name=player_name,
+                    details=f"confirm HTTP 200, body: {confirm_body[:200]}",
+                )
+            else:
+                logger.warning("Error en body de /confirm: %s", confirm_body[:300])
+
+        # Indicadores de que el formulario sigue ahí (NO se canjeó)
+        still_on_form_keywords = [
+            "editar dados", "editar datos", "edit data",
+            "canjear ahora", "resgatar agora", "redeem now",
+            "insira seu pin", "ingrese su pin",
+        ]
+        form_still_visible = any(kw in lower_text for kw in still_on_form_keywords)
+        if form_still_visible:
+            logger.warning("Página sigue en formulario - canje NO se completó")
             return RedeemResponse(
-                success=True,
-                message="PIN canjeado exitosamente",
+                success=False,
+                message="Canje no completado: el formulario sigue visible",
                 player_name=player_name,
-                details="confirm HTTP 200 + form gone",
+                details=page_text[:400].strip(),
             )
 
-        # Si no hay confirmación clara → FALLO (no asumir éxito)
+        # Si no hay confirmación clara → FALLO
         snippet = page_text[:500].strip()
         logger.warning("Resultado incierto, reportando como FALLO: %s", snippet[:200])
         return RedeemResponse(
