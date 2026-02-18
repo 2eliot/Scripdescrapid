@@ -333,65 +333,56 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         }""")
         await asyncio.sleep(0.3)  # Dejar que el JS de la página reaccione
 
-        # ── 9. Clic en botón final de canje (interceptando /confirm) ──
-        logger.info("Buscando botón de canje final...")
-        redeem_btn = page.locator(
-            '#btn-confirm,'
-            '#btn-redeem,'
-            'button:has-text("Resgatar"),'
-            'button:has-text("Canjear"),'
-            'button:has-text("Redeem"),'
-            'button:has-text("Confirmar"),'
-            'form[action="/confirm"] button[type="submit"],'
-            'button.btn-redeem'
-        ).first
+        # ── 9. Clic en botón final de canje (via JS para evitar botón oculto) ──
+        # NOTA: No usar selectores genéricos como button.btn-redeem porque
+        # coinciden con el botón "Verificar" oculto del paso 1.
+        # En su lugar, buscar el botón VISIBLE por texto via JavaScript.
+        logger.info("Buscando y haciendo clic en botón de canje final via JS...")
 
         confirm_ok = False
+        click_result = await page.evaluate("""() => {
+            // Buscar todos los botones e inputs de submit VISIBLES
+            const all = [...document.querySelectorAll('button, input[type="submit"], a.btn')];
+            const keywords = ['canjear', 'resgatar', 'redeem now', 'confirmar resgate',
+                              'confirm redeem', 'resgatar agora', 'canjear ahora'];
 
-        if await redeem_btn.count() > 0:
-            await redeem_btn.evaluate("el => el.removeAttribute('disabled')")
-            logger.info("Haciendo clic en botón de canje final (interceptando /confirm)...")
-            try:
-                async with page.expect_response(
-                    lambda r: "/confirm" in r.url or "/redeem" in r.url,
-                    timeout=15_000
-                ) as confirm_info:
-                    await redeem_btn.click(timeout=10_000)
-                confirm_resp = await confirm_info.value
-                logger.info("Respuesta /confirm: HTTP %s", confirm_resp.status)
-                if confirm_resp.status < 400:
-                    confirm_ok = True
-            except Exception as e:
-                logger.warning("No se interceptó /confirm: %s", e)
-                # Igual esperar por si la página cambió
-        else:
-            # Fallback: submit via JS
-            logger.info("Botón no encontrado, intentando submit via JS...")
-            submitted = await page.evaluate("""() => {
-                const btns = [...document.querySelectorAll('button, input[type="submit"]')];
-                for (const b of btns) {
-                    const txt = (b.textContent || b.value || '').toLowerCase();
-                    if (txt.includes('canjear') || txt.includes('resgatar') || 
-                        txt.includes('redeem') || txt.includes('confirmar')) {
-                        b.removeAttribute('disabled');
-                        b.click();
-                        return 'clicked: ' + txt.trim();
+            for (const el of all) {
+                // Solo elementos visibles
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+                const txt = (el.textContent || el.value || '').toLowerCase().trim();
+                for (const kw of keywords) {
+                    if (txt.includes(kw)) {
+                        el.removeAttribute('disabled');
+                        el.click();
+                        return {clicked: true, text: txt.substring(0, 50), id: el.id || ''};
                     }
                 }
-                const form = document.querySelector('form[action*="confirm"]') || 
-                             document.querySelector('form');
-                if (form) { form.submit(); return 'form.submit'; }
-                return null;
-            }""")
-            logger.info("Fallback submit result: %s", submitted)
-            if submitted:
-                confirm_ok = True
-            else:
-                return RedeemResponse(
-                    success=False,
-                    message="No se encontró botón de canje final",
-                    details=page_text[:300],
-                )
+            }
+
+            // Fallback: submit del form de confirmación
+            const form = document.querySelector('form[action*="confirm"]');
+            if (form) {
+                // Habilitar todos sus botones
+                form.querySelectorAll('[disabled]').forEach(el => el.removeAttribute('disabled'));
+                form.submit();
+                return {clicked: true, text: 'form.submit', id: 'form'};
+            }
+            return {clicked: false, text: '', id: ''};
+        }""")
+
+        logger.info("Click canje result: %s", click_result)
+        if click_result and click_result.get("clicked"):
+            confirm_ok = True
+        else:
+            return RedeemResponse(
+                success=False,
+                message="No se encontró botón de canje final visible",
+                details=page_text[:300],
+            )
 
         await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         await asyncio.sleep(2)
