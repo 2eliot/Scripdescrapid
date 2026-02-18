@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
 # ---------------------------------------------------------------------------
 # Configuración de logs
@@ -14,80 +14,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Globales
+# Globales — browser pre-lanzado, contexto fresco por request
+# (reCAPTCHA v3 requiere página fresca; warm page causa tokens vencidos)
 # ---------------------------------------------------------------------------
 _playwright = None
 _browser: Browser | None = None
-
-# Página pre-calentada (warm page) para recargas rápidas
-_warm_ctx: BrowserContext | None = None
-_warm_page: Page | None = None
-_warm_ready = False          # True cuando la página está lista en redeem.hype.games/
-_warm_lock = asyncio.Lock()  # Solo 1 request a la vez usa la warm page
+_redeem_lock = asyncio.Lock()  # Serializar canjes (1 a la vez)
 
 REDEEM_URL = "https://redeem.hype.games/"
 TIMEOUT_MS = 30_000
-
-
-# ---------------------------------------------------------------------------
-# Warm page management
-# ---------------------------------------------------------------------------
-async def _create_warm_page():
-    """Crea y navega una página pre-calentada lista para recibir PINes."""
-    global _warm_ctx, _warm_page, _warm_ready
-    assert _browser is not None
-    _warm_ctx = await _browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        locale="pt-BR",
-    )
-    _warm_page = await _warm_ctx.new_page()
-    logger.info("[WARM] Navegando a %s ...", REDEEM_URL)
-    await _warm_page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-    await asyncio.sleep(2)  # Cloudflare Rocket Loader
-    _warm_ready = True
-    logger.info("[WARM] Página pre-calentada y lista ✓")
-
-
-async def _reset_warm_page():
-    """Después de un canje, navega de vuelta a / para estar lista."""
-    global _warm_ready
-    _warm_ready = False
-    try:
-        if _warm_page and not _warm_page.is_closed():
-            await _warm_page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-            await asyncio.sleep(1)
-            _warm_ready = True
-            logger.info("[WARM] Página re-calentada ✓")
-        else:
-            await _create_warm_page()
-    except Exception as e:
-        logger.warning("[WARM] Error al recalentar, creando nueva: %s", e)
-        try:
-            if _warm_ctx:
-                await _warm_ctx.close()
-        except Exception:
-            pass
-        await _create_warm_page()
-
-
-async def _get_page_for_request():
-    """Obtiene una página lista. Usa la warm si está disponible, si no crea una nueva."""
-    global _warm_ready
-    if _warm_ready and _warm_page and not _warm_page.is_closed():
-        _warm_ready = False  # Marcar como en uso
-        logger.info("[WARM] Usando página pre-calentada (rápido)")
-        return _warm_page, False  # (page, is_cold)
-
-    # Página fría — crear contexto nuevo
-    logger.info("[COLD] Creando página nueva (primera vez o warm ocupada)")
-    ctx = await _browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        locale="pt-BR",
-    )
-    page = await ctx.new_page()
-    await page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-    await asyncio.sleep(2)
-    return page, True  # (page, is_cold)
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +30,8 @@ async def _get_page_for_request():
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _playwright, _browser, _warm_lock
-    _warm_lock = asyncio.Lock()
+    global _playwright, _browser, _redeem_lock
+    _redeem_lock = asyncio.Lock()
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(
         headless=True,
@@ -107,15 +42,8 @@ async def lifespan(app: FastAPI):
             "--disable-gpu",
         ],
     )
-    logger.info("Navegador pre-lanzado.")
-    # Pre-calentar una página
-    await _create_warm_page()
+    logger.info("Navegador Chromium pre-lanzado y listo ✓")
     yield
-    try:
-        if _warm_ctx:
-            await _warm_ctx.close()
-    except Exception:
-        pass
     try:
         if _browser:
             await _browser.close()
@@ -151,15 +79,24 @@ class RedeemResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Automatización principal (con warm page)
+# Automatización principal (contexto fresco por request)
 # ---------------------------------------------------------------------------
 async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
-    is_cold = False
+    ctx: BrowserContext | None = None
     start = time.time()
     try:
-        page, is_cold = await _get_page_for_request()
+        assert _browser is not None, "Navegador no inicializado"
+        ctx = await _browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            locale="pt-BR",
+        )
+        page = await ctx.new_page()
+
+        # ── 1. Navegar ──────────────────────────────────────────────
+        logger.info("Navegando a %s", REDEEM_URL)
+        await page.goto(REDEEM_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
         elapsed = time.time() - start
-        logger.info("Página lista en %.1fs (%s)", elapsed, "cold" if is_cold else "warm")
+        logger.info("Página cargada en %.1fs", elapsed)
 
         # ── 2. Ingresar el PIN ────────────────────────────────────────
         logger.info("Ingresando PIN...")
@@ -167,13 +104,10 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         await pin_input.wait_for(state="visible", timeout=TIMEOUT_MS)
         await pin_input.fill(data.pin_key)
 
-        # Esperar a que el botón se habilite (el JS lo habilita cuando el PIN es válido)
+        # Esperar a que el botón se habilite
         logger.info("Esperando que botón Verificar se habilite...")
         btn_validate = page.locator("#btn-validate")
         await btn_validate.wait_for(state="visible", timeout=TIMEOUT_MS)
-
-        # Si autoSubmitPin=true el form se envía solo; si no, esperamos que se habilite
-        # Intentar esperar a que el botón no tenga "disabled"
         for _ in range(30):
             disabled = await btn_validate.get_attribute("disabled")
             if disabled is None:
@@ -183,10 +117,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         logger.info("Haciendo clic en Verificar...")
         await btn_validate.click()
 
-        # Esperar a que la tarjeta haga flip (aparece .card.back con el formulario)
-        logger.info("Esperando flip de tarjeta...")
-        await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        await asyncio.sleep(0.5)
+        # Esperar a que .card.back aparezca (el flip real del formulario)
+        logger.info("Esperando flip de tarjeta (.card.back visible)...")
+        try:
+            await page.locator(".card.back").wait_for(state="visible", timeout=TIMEOUT_MS)
+        except Exception:
+            # Fallback: esperar networkidle + chequear texto
+            await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
+            await asyncio.sleep(1)
 
         # ── 3. Verificar errores de PIN ────────────────────────────────
         page_text = await page.inner_text("body")
@@ -412,18 +350,24 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             message="Error de automatización",
             details=str(exc),
         )
+    finally:
+        if ctx:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+        elapsed = time.time() - start
+        logger.info("Canje completado en %.1fs", elapsed)
 
 
 # ---------------------------------------------------------------------------
-# Endpoint de la API (con lock para serializar requests + recalentar página)
+# Endpoint de la API
 # ---------------------------------------------------------------------------
 @app.post("/redeem", response_model=RedeemResponse)
 async def redeem_pin(data: RedeemRequest):
     logger.info("Petición de canje recibida para player_id=%s", data.player_id)
-    async with _warm_lock:  # Solo 1 canje a la vez
+    async with _redeem_lock:
         result = await automate_redeem(data)
-        # Recalentar página para el siguiente request (en background)
-        asyncio.create_task(_reset_warm_page())
     return result
 
 
@@ -432,7 +376,6 @@ async def health():
     return {
         "status": "ok",
         "browser_ready": _browser is not None,
-        "warm_page_ready": _warm_ready,
     }
 
 
