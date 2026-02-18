@@ -444,77 +444,154 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("Intento 1 falló (timeout /confirm): %s", e)
 
-        # === Intento 2: JS submit con reCAPTCHA token fresco ===
+        # === Intento 2: Buscar sitekey + reCAPTCHA token + submit via JS ===
         if not confirm_ok and not confirm_body:
-            logger.info("Intento 2: Submit via JS con reCAPTCHA token fresco...")
+            # Primero: diagnosticar reCAPTCHA y buscar sitekey
+            recaptcha_diag = await page.evaluate("""() => {
+                const diag = {
+                    hasGrecaptcha: !!window.grecaptcha,
+                    hasExecute: !!(window.grecaptcha && window.grecaptcha.execute),
+                    sitekey: null,
+                    method: null
+                };
+                // Método 1: data-sitekey en el DOM
+                const el = document.querySelector('[data-sitekey]');
+                if (el) { diag.sitekey = el.getAttribute('data-sitekey'); diag.method = 'data-sitekey'; return diag; }
+
+                // Método 2: reCAPTCHA iframe src
+                const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+                for (const f of iframes) {
+                    const m = f.src.match(/[?&]k=([^&]+)/);
+                    if (m) { diag.sitekey = m[1]; diag.method = 'iframe_src'; return diag; }
+                }
+
+                // Método 3: script tags con sitekey
+                const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                for (const s of scripts) {
+                    const m = s.src.match(/render=([^&]+)/);
+                    if (m) { diag.sitekey = m[1]; diag.method = 'script_render'; return diag; }
+                }
+
+                // Método 4: grecaptcha internal config
+                try {
+                    const cfg = window.___grecaptcha_cfg;
+                    if (cfg && cfg.clients) {
+                        for (const cid in cfg.clients) {
+                            const c = cfg.clients[cid];
+                            if (c && c.Hm) { diag.sitekey = c.Hm; diag.method = 'grecaptcha_cfg_Hm'; return diag; }
+                            // Buscar recursivamente
+                            const json = JSON.stringify(c);
+                            const m = json.match(/6L[a-zA-Z0-9_-]{38,}/);
+                            if (m) { diag.sitekey = m[0]; diag.method = 'grecaptcha_cfg_regex'; return diag; }
+                        }
+                    }
+                } catch(e) {}
+
+                // Método 5: buscar en todo el HTML
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/6L[a-zA-Z0-9_-]{38,}/);
+                if (m) { diag.sitekey = m[0]; diag.method = 'html_regex'; }
+
+                return diag;
+            }""")
+            logger.info("reCAPTCHA diagnóstico: %s", recaptcha_diag)
+
+            sitekey = recaptcha_diag.get('sitekey')
+
+            if sitekey and recaptcha_diag.get('hasExecute'):
+                logger.info("Intento 2: Token fresco con sitekey=%s...", sitekey[:20])
+                try:
+                    async with page.expect_response(
+                        lambda r: "/confirm" in r.url,
+                        timeout=15_000
+                    ) as confirm_info:
+                        js_result = await page.evaluate("""(sk) => {
+                            return new Promise((resolve) => {
+                                window.grecaptcha.execute(sk, {action: 'confirm'}).then(token => {
+                                    // Inyectar token
+                                    let inp = document.querySelector('#g-recaptcha-response') ||
+                                              document.querySelector('textarea[name="g-recaptcha-response"]');
+                                    if (!inp) {
+                                        document.querySelectorAll('textarea').forEach(t => {
+                                            if (t.name && t.name.includes('recaptcha')) inp = t;
+                                        });
+                                    }
+                                    if (inp) { inp.value = token; inp.innerHTML = token; }
+
+                                    // Click el botón
+                                    const btn = document.querySelector('#btn-redeem');
+                                    if (btn) {
+                                        btn.removeAttribute('disabled');
+                                        btn.click();
+                                        resolve('clicked_with_token_' + token.substring(0,20));
+                                    } else { resolve('no_btn'); }
+                                }).catch(err => resolve('recaptcha_error: ' + err.message));
+                            });
+                        }""", sitekey)
+                        logger.info("JS submit result: %s", js_result)
+                    confirm_resp = await confirm_info.value
+                    logger.info("Respuesta /confirm (JS): HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
+                    try:
+                        confirm_body = await confirm_resp.text()
+                        logger.info("Body /confirm (JS) (500 chars): %s", confirm_body[:500].replace("\n", " "))
+                    except Exception as te:
+                        logger.warning("No se pudo leer body de /confirm (JS): %s", te)
+                    if confirm_resp.status < 400:
+                        confirm_ok = True
+                except Exception as e:
+                    logger.warning("Intento 2 falló: %s", e)
+            else:
+                logger.warning("No se encontró sitekey de reCAPTCHA, no se puede hacer Intento 2")
+
+        # === Intento 3: Fetch directo a /confirm con todos los datos ===
+        if not confirm_ok and not confirm_body:
+            logger.info("Intento 3: Fetch directo a /confirm...")
             try:
                 async with page.expect_response(
                     lambda r: "/confirm" in r.url,
                     timeout=15_000
                 ) as confirm_info:
                     js_result = await page.evaluate("""() => {
-                        return new Promise((resolve) => {
-                            // Buscar el sitekey de reCAPTCHA
-                            const recaptchaEl = document.querySelector('[data-sitekey]');
-                            const siteKey = recaptchaEl ? recaptchaEl.getAttribute('data-sitekey') : null;
-
-                            if (window.grecaptcha && siteKey) {
-                                // Obtener token fresco de reCAPTCHA v3
-                                window.grecaptcha.execute(siteKey, {action: 'confirm'}).then(token => {
-                                    // Insertar token en el form
-                                    let tokenInput = document.querySelector('input[name="g-recaptcha-response"]') ||
-                                                     document.querySelector('#g-recaptcha-response');
-                                    if (!tokenInput) {
-                                        tokenInput = document.createElement('input');
-                                        tokenInput.type = 'hidden';
-                                        tokenInput.name = 'g-recaptcha-response';
-                                        const form = document.querySelector('form') || document.querySelector('.card.back form') || document.body;
-                                        form.appendChild(tokenInput);
+                        return new Promise(async (resolve) => {
+                            try {
+                                // Recolectar datos del formulario
+                                const formData = {};
+                                document.querySelectorAll('input, select, textarea').forEach(el => {
+                                    if (el.name || el.id) {
+                                        const key = el.name || el.id;
+                                        if (el.type === 'checkbox') { formData[key] = el.checked; }
+                                        else { formData[key] = el.value; }
                                     }
-                                    tokenInput.value = token;
-
-                                    // Hacer click en el botón (ahora con token válido)
-                                    const btn = document.querySelector('#btn-redeem');
-                                    if (btn) {
-                                        btn.removeAttribute('disabled');
-                                        btn.click();
-                                        resolve('clicked_with_token');
-                                    } else {
-                                        resolve('no_btn');
-                                    }
-                                }).catch(err => {
-                                    resolve('recaptcha_error: ' + err.message);
                                 });
-                            } else if (window.grecaptcha && window.grecaptcha.execute) {
-                                // Intentar sin sitekey (puede ser reCAPTCHA v2 invisible)
-                                try {
-                                    window.grecaptcha.execute();
-                                    resolve('executed_v2');
-                                } catch(e) {
-                                    // Sin reCAPTCHA, click directo
-                                    const btn = document.querySelector('#btn-redeem');
-                                    if (btn) { btn.click(); resolve('clicked_no_recaptcha'); }
-                                    else { resolve('no_btn_no_recaptcha'); }
+
+                                // Buscar el form action o construir la URL
+                                const form = document.querySelector('form');
+                                const action = form ? (form.action || '/confirm') : '/confirm';
+
+                                // Submit el form directamente
+                                if (form) {
+                                    form.submit();
+                                    resolve('form_submitted');
+                                } else {
+                                    resolve('no_form_found: ' + JSON.stringify(Object.keys(formData)));
                                 }
-                            } else {
-                                const btn = document.querySelector('#btn-redeem');
-                                if (btn) { btn.click(); resolve('clicked_no_grecaptcha'); }
-                                else { resolve('no_btn_no_grecaptcha'); }
+                            } catch(e) {
+                                resolve('error: ' + e.message);
                             }
                         });
                     }""")
-                    logger.info("JS submit result: %s", js_result)
+                    logger.info("Intento 3 result: %s", js_result)
                 confirm_resp = await confirm_info.value
-                logger.info("Respuesta /confirm (JS): HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
+                logger.info("Respuesta /confirm (form.submit): HTTP %s", confirm_resp.status)
                 try:
                     confirm_body = await confirm_resp.text()
-                    logger.info("Body /confirm (JS) (500 chars): %s", confirm_body[:500].replace("\n", " "))
-                except Exception as te:
-                    logger.warning("No se pudo leer body de /confirm (JS): %s", te)
+                    logger.info("Body /confirm (form) (500 chars): %s", confirm_body[:500].replace("\n", " "))
+                except Exception:
+                    pass
                 if confirm_resp.status < 400:
                     confirm_ok = True
             except Exception as e:
-                logger.warning("Intento 2 (JS submit) falló: %s", e)
+                logger.warning("Intento 3 (form.submit) falló: %s", e)
 
         if not confirm_ok and not confirm_body:
             logger.warning("Ambos intentos de submit fallaron")
