@@ -316,20 +316,50 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
-        # ── 8. Marcar checkboxes con Playwright TRUSTED click ──────────
-        # JS checkbox.checked=true NO activa los handlers del framework.
-        # Necesitamos click real de Playwright para que el form acepte los términos.
-        logger.info("Marcando checkboxes con Playwright (trusted click)...")
+        # ── 8. Marcar checkboxes (términos y privacidad) ──────────────
+        logger.info("Marcando checkboxes de términos...")
+
+        # Primero: intentar click Playwright en checkboxes estándar
         all_checkboxes = page.locator('input[type="checkbox"]')
         cb_count = await all_checkboxes.count()
+        logger.info("Checkboxes encontrados: %d", cb_count)
         for i in range(cb_count):
             cb = all_checkboxes.nth(i)
             try:
                 if await cb.is_visible() and not await cb.is_checked():
                     await cb.click(timeout=3000)
                     logger.info("Checkbox %d marcado via Playwright", i)
+                elif not await cb.is_visible():
+                    # Click en el label asociado si el checkbox está oculto
+                    cb_id = await cb.get_attribute("id")
+                    if cb_id:
+                        label = page.locator(f'label[for="{cb_id}"]')
+                        if await label.count() > 0 and await label.is_visible():
+                            await label.click(timeout=3000)
+                            logger.info("Checkbox %d marcado via label (id=%s)", i, cb_id)
             except Exception as e:
                 logger.warning("Checkbox %d falló: %s", i, e)
+
+        # Segundo: marcar via JS como fallback (custom checkboxes, styled divs, etc.)
+        cb_js_result = await page.evaluate("""() => {
+            let marked = 0;
+            // Checkboxes estándar
+            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', {bubbles:true})); marked++; }
+            });
+            // Custom checkbox containers (divs/spans con role=checkbox)
+            document.querySelectorAll('[role="checkbox"]').forEach(el => {
+                if (el.getAttribute('aria-checked') !== 'true') {
+                    el.click(); marked++;
+                }
+            });
+            // Labels de checkbox que pueden necesitar click
+            document.querySelectorAll('.checkbox-label, .custom-checkbox, .terms-checkbox').forEach(el => {
+                el.click(); marked++;
+            });
+            return marked;
+        }""")
+        logger.info("Checkboxes marcados via JS fallback: %d", cb_js_result)
 
         await asyncio.sleep(0.5)
 
@@ -431,24 +461,53 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     details=kw,
                 )
 
-        # Si /confirm respondió 200, verificar su body para errores
+        # Si /confirm respondió, analizar el body (puede ser JSON)
         if confirm_ok and confirm_body:
-            confirm_lower = confirm_body.lower()
-            # Si el body de /confirm contiene error claro
-            error_in_confirm = any(e in confirm_lower for e in [
-                "error", "failed", "invalid", "expired", "falhou", "falló"
-            ])
-            if not error_in_confirm:
-                # /confirm HTTP 200, sin errores en body → probablemente éxito
-                logger.info("Canje exitoso (/confirm HTTP 200, sin errores en body). Jugador: %s", player_name)
-                return RedeemResponse(
-                    success=True,
-                    message="PIN canjeado exitosamente",
-                    player_name=player_name,
-                    details=f"confirm HTTP 200, body: {confirm_body[:200]}",
-                )
+            # Intentar parsear como JSON primero
+            confirm_json = None
+            try:
+                import json as _json
+                confirm_json = _json.loads(confirm_body)
+            except Exception:
+                pass
+
+            if confirm_json and isinstance(confirm_json, dict):
+                # JSON con campo Success explícito
+                if confirm_json.get("Success") is True:
+                    logger.info("Canje exitoso (/confirm JSON Success=true). Jugador: %s", player_name)
+                    return RedeemResponse(
+                        success=True,
+                        message="PIN canjeado exitosamente",
+                        player_name=player_name,
+                        details=f"confirm JSON: {confirm_body[:200]}",
+                    )
+                else:
+                    # JSON con Success=false → FALLO claro
+                    err_msg = confirm_json.get("Message", confirm_body[:200])
+                    logger.warning("Confirm JSON Success=false: %s", err_msg)
+                    return RedeemResponse(
+                        success=False,
+                        message=f"Error del servidor: {err_msg}",
+                        player_name=player_name,
+                        details=confirm_body[:300],
+                    )
             else:
-                logger.warning("Error en body de /confirm: %s", confirm_body[:300])
+                # Body no es JSON, buscar keywords de error
+                confirm_lower = confirm_body.lower()
+                error_in_confirm = any(e in confirm_lower for e in [
+                    "error", "erro", "failed", "invalid", "expired",
+                    "falhou", "falló", "tente novamente", "try again",
+                ])
+                if not error_in_confirm:
+                    logger.info("Canje exitoso (/confirm HTTP 200, sin errores en body). Jugador: %s", player_name)
+                    return RedeemResponse(
+                        success=True,
+                        message="PIN canjeado exitosamente",
+                        player_name=player_name,
+                        details=f"confirm HTTP 200, body: {confirm_body[:200]}",
+                    )
+                else:
+                    logger.warning("Error en body de /confirm: %s", confirm_body[:300])
 
         # Indicadores de que el formulario sigue ahí (NO se canjeó)
         still_on_form_keywords = [
