@@ -128,6 +128,39 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         elapsed = time.time() - start
         logger.info("Página cargada en %.1fs", elapsed)
 
+        # ── Cerrar cookie consent popup si existe ──────────────────────
+        try:
+            cookie_dismissed = await page.evaluate("""() => {
+                // Buscar botones de aceptar cookies
+                const selectors = [
+                    'button[id*="accept"]', 'button[id*="Accept"]',
+                    'a[id*="accept"]', 'a[id*="Accept"]',
+                    '.cc-accept', '.cc-dismiss',
+                    'button.accept-cookies',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { el.click(); return 'clicked: ' + sel; }
+                }
+                // Buscar por texto en botones
+                const allBtns = document.querySelectorAll('button, a.btn, a[role="button"]');
+                for (const btn of allBtns) {
+                    const txt = btn.textContent.trim().toLowerCase();
+                    if (txt === 'aceptar' || txt === 'accept' || txt === 'aceitar' ||
+                        txt === 'accept all' || txt === 'aceptar todo' || txt === 'aceptar todas') {
+                        btn.click(); return 'clicked_text: ' + txt;
+                    }
+                }
+                // Eliminar overlays de cookies por fuerza
+                document.querySelectorAll('[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]').forEach(el => {
+                    el.remove();
+                });
+                return 'no_btn_found_overlays_removed';
+            }""")
+            logger.info("Cookie popup: %s", cookie_dismissed)
+        except Exception as e:
+            logger.warning("Cookie popup dismiss falló: %s", e)
+
         # Esperar a que reCAPTCHA esté disponible
         recaptcha_ready = False
         for _ in range(20):
@@ -366,6 +399,18 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         confirm_ok = False
         confirm_body = ""
+
+        # Eliminar cookie popup y overlays que bloquean clicks
+        await page.evaluate("""() => {
+            document.querySelectorAll(
+                '[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"], ' +
+                '[class*="Cookie"], [class*="Consent"], .cc-window, .cc-banner, #onetrust-banner-sdk'
+            ).forEach(el => el.remove());
+            // También remover cualquier overlay/backdrop
+            document.querySelectorAll('[class*="overlay"], [class*="backdrop"], [class*="modal"]').forEach(el => {
+                if (el.id !== 'btn-redeem' && !el.closest('.card')) el.remove();
+            });
+        }""")
 
         # Habilitar btn-redeem via JS
         await page.evaluate("""() => {
