@@ -257,10 +257,10 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         logger.info("Formulario detectado en .card.back")
 
-        # ── 4. Llenar formulario COMPLETO de golpe via JS (instantáneo) ──
-        logger.info("Llenando formulario via JS instantáneo...")
+        # ── 4. Llenar campos de texto via JS (instantáneo) ──────────
+        logger.info("Llenando campos de texto via JS...")
         fill_ok = await page.evaluate("""(args) => {
-            const {name, born, country, playerId} = args;
+            const {name, born, playerId} = args;
 
             // Nombre
             const nameEl = document.querySelector('#Name');
@@ -270,30 +270,73 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             const bornEl = document.querySelector('#BornAt');
             if (bornEl) { bornEl.value = born; bornEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-            // País — buscar por texto parcial en las opciones del select
-            const selEl = document.querySelector('#NationalityAlphaCode');
-            if (selEl) {
-                const countryLower = country.toLowerCase();
-                for (const opt of selEl.options) {
-                    if (opt.text.toLowerCase().includes(countryLower)) {
-                        selEl.value = opt.value;
-                        selEl.dispatchEvent(new Event('change', {bubbles:true}));
-                        break;
-                    }
-                }
-            }
-
             // Player ID
             const idEl = document.querySelector('#GameAccountId');
             if (idEl) { idEl.value = playerId; idEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-            // NO tocar checkbox aquí — se marca con Playwright trusted click en paso 8
-
             return !!(nameEl && bornEl && idEl);
         }""", {"name": data.full_name, "born": data.birth_date,
-               "country": data.country, "playerId": data.player_id})
-        logger.info("Formulario llenado via JS: %s (nombre=%s, id=%s)",
+               "playerId": data.player_id})
+        logger.info("Campos texto llenados: %s (nombre=%s, id=%s)",
                      "OK" if fill_ok else "parcial", data.full_name, data.player_id)
+
+        # ── 5. Seleccionar país con Playwright (trusted) ──────────
+        # Las opciones se cargan async desde /countries — esperar a que existan
+        country_sel = page.locator("#NationalityAlphaCode")
+        logger.info("Esperando opciones del select de país...")
+        for attempt in range(20):
+            opt_count = await country_sel.evaluate("el => el.options.length")
+            if opt_count > 1:  # >1 porque la primera es el placeholder
+                break
+            await asyncio.sleep(0.3)
+        logger.info("Opciones de país cargadas: %d", opt_count)
+
+        # Seleccionar país via Playwright select_option (trusted, dispara events nativos)
+        country_selected = False
+        country_name = data.country.lower()
+        try:
+            # Intentar por label parcial — obtener opciones y buscar match
+            options_info = await country_sel.evaluate("""(el) => {
+                return Array.from(el.options).map(o => ({value: o.value, text: o.text})).slice(0, 5);
+            }""")
+            logger.info("Primeras 5 opciones: %s", options_info)
+
+            # Buscar el value de la opción que contenga el nombre del país
+            target_value = await country_sel.evaluate("""(el, cn) => {
+                for (const opt of el.options) {
+                    if (opt.text.toLowerCase().includes(cn)) return opt.value;
+                }
+                return null;
+            }""", country_name)
+
+            if target_value:
+                await country_sel.select_option(value=target_value)
+                logger.info("País seleccionado via Playwright: value=%s", target_value)
+                country_selected = True
+            else:
+                logger.warning("No se encontró opción para país '%s'", data.country)
+        except Exception as e:
+            logger.warning("Error seleccionando país via Playwright: %s", e)
+
+        if not country_selected:
+            # Fallback: seleccionar Chile (CountryId=5 en los hidden fields)
+            logger.info("Fallback: seleccionando Chile...")
+            try:
+                target_value = await country_sel.evaluate("""(el) => {
+                    for (const opt of el.options) {
+                        if (opt.text.toLowerCase().includes('chile')) return opt.value;
+                    }
+                    // Si no hay Chile, seleccionar la primera opción no vacía
+                    for (const opt of el.options) {
+                        if (opt.value) return opt.value;
+                    }
+                    return null;
+                }""")
+                if target_value:
+                    await country_sel.select_option(value=target_value)
+                    logger.info("Chile seleccionado: value=%s", target_value)
+            except Exception as e:
+                logger.warning("Fallback país falló: %s", e)
 
         # ── 6. Clic en botón VERIFICAR ID ────────────────────────────
         # El JS llama a validate/account via AJAX que retorna {"Success":true,"Username":"NOMBRE"}
