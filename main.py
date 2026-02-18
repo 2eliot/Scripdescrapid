@@ -92,11 +92,23 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         )
         page = await ctx.new_page()
 
-        # ── 1. Navegar ──────────────────────────────────────────────
+        # ── 1. Navegar (networkidle para que reCAPTCHA v3 cargue) ──────
         logger.info("Navegando a %s", REDEEM_URL)
-        await page.goto(REDEEM_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        await page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+        await asyncio.sleep(2)  # Cloudflare Rocket Loader
         elapsed = time.time() - start
         logger.info("Página cargada en %.1fs", elapsed)
+
+        # Esperar a que reCAPTCHA esté disponible
+        recaptcha_ready = False
+        for _ in range(20):
+            recaptcha_ready = await page.evaluate(
+                "() => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function'"
+            )
+            if recaptcha_ready:
+                break
+            await asyncio.sleep(0.5)
+        logger.info("reCAPTCHA disponible: %s", recaptcha_ready)
 
         # ── 2. Ingresar el PIN ────────────────────────────────────────
         logger.info("Ingresando PIN...")
@@ -114,17 +126,31 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 break
             await asyncio.sleep(0.2)
 
-        logger.info("Haciendo clic en Verificar...")
-        await btn_validate.click()
+        # Clic en Verificar e interceptar la respuesta AJAX de /validate
+        logger.info("Haciendo clic en Verificar (interceptando /validate)...")
+        validate_response = None
+        try:
+            async with page.expect_response(
+                lambda r: "/validate" in r.url and "account" not in r.url,
+                timeout=TIMEOUT_MS
+            ) as resp_info:
+                await btn_validate.click()
+            validate_response = await resp_info.value
+            validate_status = validate_response.status
+            logger.info("Respuesta /validate: HTTP %s", validate_status)
+            if validate_status >= 400:
+                body = await validate_response.text()
+                logger.warning("Error en /validate: %s", body[:300])
+        except Exception as e:
+            logger.warning("No se pudo interceptar /validate: %s", e)
+            # Continuar de todos modos
 
         # Esperar a que .card.back aparezca (el flip real del formulario)
         logger.info("Esperando flip de tarjeta (.card.back visible)...")
         try:
-            await page.locator(".card.back").wait_for(state="visible", timeout=TIMEOUT_MS)
+            await page.locator(".card.back").wait_for(state="visible", timeout=15_000)
         except Exception:
-            # Fallback: esperar networkidle + chequear texto
-            await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
         # ── 3. Verificar errores de PIN ────────────────────────────────
         page_text = await page.inner_text("body")
