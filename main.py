@@ -245,8 +245,10 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     await checkbox.check()
 
         # ── 6. Clic en botón VERIFICAR ID ────────────────────────────
-        # El JS llama a validate/account via AJAX. El botón puede tener
-        # textos: "Verificar ID", "Verify ID", "Verificar"
+        # El JS llama a validate/account via AJAX que retorna {"Success":true,"Username":"NOMBRE"}
+        # Interceptamos esa respuesta para obtener el player_name directamente
+        player_name = None
+
         logger.info("Buscando botón de verificar ID...")
         verify_btn = page.locator(
             'button:has-text("Verificar ID"),'
@@ -255,71 +257,36 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             '#btn-verify-account'
         ).first
         if await verify_btn.count() > 0:
-            logger.info("Haciendo clic en Verificar ID...")
-            await verify_btn.click()
-            await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-            await asyncio.sleep(3)
+            logger.info("Haciendo clic en Verificar ID (interceptando respuesta AJAX)...")
 
-            # Verificar errores de ID
-            page_text = await page.inner_text("body")
-            lower_text = page_text.lower()
-            id_error_keywords = [
-                "id not found", "player not found",
-                "id não encontrado", "id no encontrado",
-                "invalid id", "id inválido",
-                "does not exist", "no existe", "não existe",
-                "usuario no encontrado", "failed",
-            ]
-            for kw in id_error_keywords:
-                if kw.lower() in lower_text:
-                    logger.warning("Error de ID: %s", kw)
+            # Interceptar la respuesta de validate/account para obtener Username
+            async with page.expect_response(
+                lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
+            ) as response_info:
+                await verify_btn.click()
+
+            try:
+                resp = await response_info.value
+                resp_json = await resp.json()
+                logger.info("Respuesta validate/account: %s", resp_json)
+
+                if resp_json.get("Success"):
+                    player_name = resp_json.get("Username", "")
+                    logger.info("Player name desde AJAX: %s", player_name)
+                else:
+                    error_msg = resp_json.get("Message", "ID inválido")
+                    logger.warning("Error de ID: %s", error_msg)
                     return RedeemResponse(
                         success=False,
                         message="Error de ID del jugador",
-                        details=f"'{kw}'",
+                        details=error_msg,
                     )
-            logger.info("ID verificado correctamente")
+            except Exception as e:
+                logger.warning("No se pudo parsear respuesta validate/account: %s", e)
+
+            await asyncio.sleep(2)
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
-
-        # ── 7. Extraer nombre del jugador ────────────────────────────
-        player_name = None
-        page_text = await page.inner_text("body")
-
-        # Buscar marcadores de verificación exitosa
-        verified_markers = ["id verificado", "id verified", "id verificado ✓"]
-        is_verified = any(m in page_text.lower() for m in verified_markers)
-
-        if is_verified:
-            logger.info("ID verificado, extrayendo nombre...")
-            try:
-                # Buscar contenedor con clase que contenga account/player/nickname
-                name_container = page.locator(
-                    '[class*="account" i],'
-                    '[class*="player" i],'
-                    '[class*="nickname" i]'
-                ).first
-                if await name_container.count() > 0:
-                    player_name = (await name_container.inner_text()).strip()
-            except Exception:
-                pass
-
-            if not player_name:
-                try:
-                    for marker in ["ID verificado", "ID verified"]:
-                        idx = page_text.find(marker)
-                        if idx != -1:
-                            after = page_text[idx + len(marker):idx + len(marker) + 100]
-                            after = after.replace("✓", "").replace("✔", "").strip()
-                            lines = [l.strip() for l in after.split("\n") if l.strip()]
-                            lines = [l for l in lines if "verifica" not in l.lower() and "confirm" not in l.lower()]
-                            if lines:
-                                player_name = lines[0]
-                                break
-                except Exception:
-                    pass
-
-            logger.info("Nombre extraído: %s", player_name)
 
         # ── 8. Clic en botón final de canje ──────────────────────────
         # El form tiene action="/confirm". El botón submit puede tener
