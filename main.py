@@ -174,11 +174,11 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # Si autoSubmitPin=true el form se envía solo; si no, esperamos que se habilite
         # Intentar esperar a que el botón no tenga "disabled"
-        for _ in range(20):
+        for _ in range(30):
             disabled = await btn_validate.get_attribute("disabled")
             if disabled is None:
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
 
         logger.info("Haciendo clic en Verificar...")
         await btn_validate.click()
@@ -186,7 +186,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Esperar a que la tarjeta haga flip (aparece .card.back con el formulario)
         logger.info("Esperando flip de tarjeta...")
         await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
 
         # ── 3. Verificar errores de PIN ────────────────────────────────
         page_text = await page.inner_text("body")
@@ -231,71 +231,45 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         logger.info("Formulario detectado en .card.back")
 
-        # ── 4. Llenar formulario de verificación ─────────────────────
-        logger.info("Llenando formulario...")
+        # ── 4. Llenar formulario COMPLETO de golpe via JS (instantáneo) ──
+        logger.info("Llenando formulario via JS instantáneo...")
+        fill_ok = await page.evaluate("""(args) => {
+            const {name, born, country, playerId} = args;
 
-        # Nombre Completo (input#Name)
-        name_input = page.locator("#Name")
-        if await name_input.count() > 0:
-            await name_input.fill(data.full_name)
-            logger.info("Nombre: %s", data.full_name)
-        else:
-            # Fallback: primer input de texto visible en .card.back
-            name_input = card_back.locator("input[type='text']").first
-            await name_input.fill(data.full_name)
+            // Nombre
+            const nameEl = document.querySelector('#Name');
+            if (nameEl) { nameEl.value = name; nameEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-        # Fecha de Nacimiento (input#BornAt)
-        date_input = page.locator("#BornAt")
-        if await date_input.count() > 0:
-            await date_input.fill(data.birth_date)
-            logger.info("Fecha: %s", data.birth_date)
-        else:
-            date_input = card_back.locator("input[type='text']").nth(1)
-            await date_input.fill(data.birth_date)
+            // Fecha de nacimiento
+            const bornEl = document.querySelector('#BornAt');
+            if (bornEl) { bornEl.value = born; bornEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-        # Nacionalidad (select#NationalityAlphaCode)
-        logger.info("Seleccionando país: %s", data.country)
-        country_select = page.locator("#NationalityAlphaCode")
-        if await country_select.count() > 0:
-            await asyncio.sleep(1)  # Esperar a que se carguen las opciones via AJAX
-            try:
-                await country_select.select_option(label=data.country)
-            except Exception:
-                # Buscar coincidencia parcial
-                options = await country_select.locator("option").all()
-                matched = False
-                for opt in options:
-                    opt_text = (await opt.inner_text()).strip()
-                    if data.country.lower() in opt_text.lower():
-                        value = await opt.get_attribute("value")
-                        await country_select.select_option(value=value)
-                        matched = True
-                        break
-                if not matched:
-                    logger.warning("País '%s' no encontrado en dropdown", data.country)
+            // País — buscar por texto parcial en las opciones del select
+            const selEl = document.querySelector('#NationalityAlphaCode');
+            if (selEl) {
+                const countryLower = country.toLowerCase();
+                for (const opt of selEl.options) {
+                    if (opt.text.toLowerCase().includes(countryLower)) {
+                        selEl.value = opt.value;
+                        selEl.dispatchEvent(new Event('change', {bubbles:true}));
+                        break;
+                    }
+                }
+            }
 
-        # ID de usuario en el juego (input#GameAccountId)
-        id_input = page.locator("#GameAccountId")
-        if await id_input.count() > 0:
-            await id_input.fill(data.player_id)
-            logger.info("Player ID: %s", data.player_id)
-        else:
-            # Fallback
-            id_input = card_back.locator("input[type='text']").nth(2)
-            await id_input.fill(data.player_id)
+            // Player ID
+            const idEl = document.querySelector('#GameAccountId');
+            if (idEl) { idEl.value = playerId; idEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-        # ── 5. Marcar checkbox de privacidad ──────────────────────────
-        logger.info("Marcando checkbox de privacidad...")
-        checkbox = page.locator("#privacy")
-        if await checkbox.count() > 0:
-            is_checked = await checkbox.is_checked()
-            if not is_checked:
-                await checkbox.check()
-        else:
-            checkbox = page.locator('input[type="checkbox"]').first
-            if await checkbox.count() > 0:
-                if not await checkbox.is_checked():
-                    await checkbox.check()
+            // Checkbox privacidad
+            const cb = document.querySelector('#privacy');
+            if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', {bubbles:true})); }
+
+            return !!(nameEl && bornEl && idEl);
+        }""", {"name": data.full_name, "born": data.birth_date,
+               "country": data.country, "playerId": data.player_id})
+        logger.info("Formulario llenado via JS: %s (nombre=%s, id=%s)",
+                     "OK" if fill_ok else "parcial", data.full_name, data.player_id)
 
         # ── 6. Clic en botón VERIFICAR ID ────────────────────────────
         # El JS llama a validate/account via AJAX que retorna {"Success":true,"Username":"NOMBRE"}
@@ -337,7 +311,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("No se pudo parsear respuesta validate/account: %s", e)
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
@@ -380,7 +354,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 )
 
         await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
         # ── 9. Verificar resultado final ─────────────────────────────
         page_text = await page.inner_text("body")
