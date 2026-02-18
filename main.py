@@ -395,6 +395,31 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         await asyncio.sleep(0.5)
 
         # ── 9. Clic en botón final de canje ──────────────────────────
+
+        # Diagnosticar estado de TODOS los campos del formulario antes de submit
+        form_state = await page.evaluate("""() => {
+            const fields = {};
+            document.querySelectorAll('input, select, textarea').forEach(el => {
+                const key = el.id || el.name || el.tagName;
+                if (el.type === 'checkbox') fields[key] = {type:'checkbox', checked:el.checked, value:el.value};
+                else if (el.tagName === 'SELECT') fields[key] = {type:'select', value:el.value, text:el.options[el.selectedIndex]?.text};
+                else fields[key] = {type:el.type, value:el.value?.substring(0,50)};
+            });
+            return fields;
+        }""")
+        logger.info("Estado formulario antes de submit: %s", form_state)
+
+        # Interceptar request body de /confirm para ver qué se envía
+        confirm_request_body = None
+        async def capture_confirm_request(route):
+            nonlocal confirm_request_body
+            req = route.request
+            if "/confirm" in req.url:
+                confirm_request_body = req.post_data
+                logger.info("REQUEST a /confirm - method=%s body=%s", req.method, (confirm_request_body or '')[:500])
+            await route.continue_()
+        await page.route("**/confirm**", capture_confirm_request)
+
         logger.info("Habilitando y buscando botón de canje final...")
 
         confirm_ok = False
