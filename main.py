@@ -333,56 +333,59 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         }""")
         await asyncio.sleep(0.3)  # Dejar que el JS de la página reaccione
 
-        # ── 9. Clic en botón final de canje (via JS para evitar botón oculto) ──
-        # NOTA: No usar selectores genéricos como button.btn-redeem porque
-        # coinciden con el botón "Verificar" oculto del paso 1.
-        # En su lugar, buscar el botón VISIBLE por texto via JavaScript.
-        logger.info("Buscando y haciendo clic en botón de canje final via JS...")
+        # ── 9. Clic en botón final de canje ──────────────────────────
+        # El botón real tiene id="btn-redeem". Usamos Playwright click (trusted)
+        # porque JS el.click() no dispara reCAPTCHA v3 ni los handlers del form.
+        # Primero: habilitar el botón via JS, luego: click real con Playwright.
+        logger.info("Habilitando y buscando botón de canje final...")
 
         confirm_ok = False
-        click_result = await page.evaluate("""() => {
-            // Buscar todos los botones e inputs de submit VISIBLES
-            const all = [...document.querySelectorAll('button, input[type="submit"], a.btn')];
-            const keywords = ['canjear', 'resgatar', 'redeem now', 'confirmar resgate',
-                              'confirm redeem', 'resgatar agora', 'canjear ahora'];
 
-            for (const el of all) {
-                // Solo elementos visibles
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
-
-                const txt = (el.textContent || el.value || '').toLowerCase().trim();
-                for (const kw of keywords) {
-                    if (txt.includes(kw)) {
-                        el.removeAttribute('disabled');
-                        el.click();
-                        return {clicked: true, text: txt.substring(0, 50), id: el.id || ''};
-                    }
-                }
-            }
-
-            // Fallback: submit del form de confirmación
-            const form = document.querySelector('form[action*="confirm"]');
-            if (form) {
-                // Habilitar todos sus botones
-                form.querySelectorAll('[disabled]').forEach(el => el.removeAttribute('disabled'));
-                form.submit();
-                return {clicked: true, text: 'form.submit', id: 'form'};
-            }
-            return {clicked: false, text: '', id: ''};
+        # Habilitar btn-redeem via JS
+        await page.evaluate("""() => {
+            const btn = document.querySelector('#btn-redeem');
+            if (btn) btn.removeAttribute('disabled');
         }""")
 
-        logger.info("Click canje result: %s", click_result)
-        if click_result and click_result.get("clicked"):
-            confirm_ok = True
+        # Intentar click con Playwright en #btn-redeem (trusted click)
+        redeem_btn = page.locator("#btn-redeem")
+        if await redeem_btn.count() > 0 and await redeem_btn.is_visible():
+            logger.info("Haciendo clic Playwright en #btn-redeem (trusted)...")
+            try:
+                async with page.expect_response(
+                    lambda r: "/confirm" in r.url or "/redeem" in r.url,
+                    timeout=15_000
+                ) as confirm_info:
+                    await redeem_btn.click(timeout=10_000)
+                confirm_resp = await confirm_info.value
+                logger.info("Respuesta /confirm: HTTP %s", confirm_resp.status)
+                if confirm_resp.status < 400:
+                    confirm_ok = True
+            except Exception as e:
+                logger.warning("Click #btn-redeem o /confirm falló: %s", e)
         else:
-            return RedeemResponse(
-                success=False,
-                message="No se encontró botón de canje final visible",
-                details=page_text[:300],
-            )
+            # Fallback: buscar botón visible por texto y hacer click Playwright
+            logger.info("#btn-redeem no visible, buscando por texto...")
+            keywords = ["Resgatar", "Canjear", "Redeem"]
+            clicked = False
+            for kw in keywords:
+                btn = page.locator(f'button:visible:has-text("{kw}")').first
+                if await btn.count() > 0:
+                    await btn.evaluate("el => el.removeAttribute('disabled')")
+                    logger.info("Haciendo clic Playwright en botón '%s'...", kw)
+                    try:
+                        await btn.click(timeout=10_000)
+                        confirm_ok = True
+                        clicked = True
+                    except Exception as e:
+                        logger.warning("Click en '%s' falló: %s", kw, e)
+                    break
+            if not clicked:
+                return RedeemResponse(
+                    success=False,
+                    message="No se encontró botón de canje final visible",
+                    details=page_text[:300],
+                )
 
         await page.wait_for_load_state("networkidle", timeout=TIMEOUT_MS)
         await asyncio.sleep(2)
