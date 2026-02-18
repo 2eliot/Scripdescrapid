@@ -1,10 +1,11 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 # ---------------------------------------------------------------------------
 # Configuración de logs
@@ -13,22 +14,89 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Globales – navegador pre-lanzado para mayor velocidad
+# Globales
 # ---------------------------------------------------------------------------
 _playwright = None
 _browser: Browser | None = None
 
-# URL real de Hype Games (página en portugués brasileño)
+# Página pre-calentada (warm page) para recargas rápidas
+_warm_ctx: BrowserContext | None = None
+_warm_page: Page | None = None
+_warm_ready = False          # True cuando la página está lista en redeem.hype.games/
+_warm_lock = asyncio.Lock()  # Solo 1 request a la vez usa la warm page
+
 REDEEM_URL = "https://redeem.hype.games/"
-TIMEOUT_MS = 30_000  # espera máxima por acción
+TIMEOUT_MS = 30_000
 
 
 # ---------------------------------------------------------------------------
-# Ciclo de vida – iniciar / cerrar navegador con la app
+# Warm page management
+# ---------------------------------------------------------------------------
+async def _create_warm_page():
+    """Crea y navega una página pre-calentada lista para recibir PINes."""
+    global _warm_ctx, _warm_page, _warm_ready
+    assert _browser is not None
+    _warm_ctx = await _browser.new_context(
+        viewport={"width": 1280, "height": 720},
+        locale="pt-BR",
+    )
+    _warm_page = await _warm_ctx.new_page()
+    logger.info("[WARM] Navegando a %s ...", REDEEM_URL)
+    await _warm_page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+    await asyncio.sleep(2)  # Cloudflare Rocket Loader
+    _warm_ready = True
+    logger.info("[WARM] Página pre-calentada y lista ✓")
+
+
+async def _reset_warm_page():
+    """Después de un canje, navega de vuelta a / para estar lista."""
+    global _warm_ready
+    _warm_ready = False
+    try:
+        if _warm_page and not _warm_page.is_closed():
+            await _warm_page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+            await asyncio.sleep(1)
+            _warm_ready = True
+            logger.info("[WARM] Página re-calentada ✓")
+        else:
+            await _create_warm_page()
+    except Exception as e:
+        logger.warning("[WARM] Error al recalentar, creando nueva: %s", e)
+        try:
+            if _warm_ctx:
+                await _warm_ctx.close()
+        except Exception:
+            pass
+        await _create_warm_page()
+
+
+async def _get_page_for_request():
+    """Obtiene una página lista. Usa la warm si está disponible, si no crea una nueva."""
+    global _warm_ready
+    if _warm_ready and _warm_page and not _warm_page.is_closed():
+        _warm_ready = False  # Marcar como en uso
+        logger.info("[WARM] Usando página pre-calentada (rápido)")
+        return _warm_page, False  # (page, is_cold)
+
+    # Página fría — crear contexto nuevo
+    logger.info("[COLD] Creando página nueva (primera vez o warm ocupada)")
+    ctx = await _browser.new_context(
+        viewport={"width": 1280, "height": 720},
+        locale="pt-BR",
+    )
+    page = await ctx.new_page()
+    await page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
+    await asyncio.sleep(2)
+    return page, True  # (page, is_cold)
+
+
+# ---------------------------------------------------------------------------
+# Ciclo de vida
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _playwright, _browser
+    global _playwright, _browser, _warm_lock
+    _warm_lock = asyncio.Lock()
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(
         headless=True,
@@ -39,12 +107,25 @@ async def lifespan(app: FastAPI):
             "--disable-gpu",
         ],
     )
-    logger.info("Navegador pre-lanzado y listo.")
+    logger.info("Navegador pre-lanzado.")
+    # Pre-calentar una página
+    await _create_warm_page()
     yield
-    if _browser:
-        await _browser.close()
-    if _playwright:
-        await _playwright.stop()
+    try:
+        if _warm_ctx:
+            await _warm_ctx.close()
+    except Exception:
+        pass
+    try:
+        if _browser:
+            await _browser.close()
+    except Exception:
+        pass
+    try:
+        if _playwright:
+            await _playwright.stop()
+    except Exception:
+        pass
     logger.info("Navegador cerrado.")
 
 
@@ -52,12 +133,12 @@ app = FastAPI(title="Hype Games - Canjeador de PIN", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# Modelos de petición / respuesta
+# Modelos
 # ---------------------------------------------------------------------------
 class RedeemRequest(BaseModel):
     pin_key: str
     full_name: str
-    birth_date: str   # formato esperado: DD/MM/YYYY (ej. "23/03/1998")
+    birth_date: str
     player_id: str
     country: str
 
@@ -70,43 +151,15 @@ class RedeemResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Auxiliar – crea un contexto nuevo (cookies/sesión aisladas) por petición
-# ---------------------------------------------------------------------------
-async def _new_context() -> BrowserContext:
-    assert _browser is not None, "Navegador no inicializado"
-    ctx = await _browser.new_context(
-        viewport={"width": 1280, "height": 720},
-        locale="pt-BR",
-    )
-    return ctx
-
-
-# ---------------------------------------------------------------------------
-# Automatización principal
-# Página real: https://redeem.hype.games/ (portugués brasileño)
-# Estructura: card.front (PIN input) -> flip -> card.back (formulario)
-# Elementos clave:
-#   - Input PIN:    #pininput
-#   - Botón PIN:    #btn-validate (texto "Verificar", empieza disabled)
-#   - Formulario:   .card.back (aparece después de validar PIN)
-#   - Nombre:       input#Name
-#   - Fecha nac.:   input#BornAt
-#   - Nacionalidad: select#NationalityAlphaCode
-#   - Player ID:    input#GameAccountId
-#   - Checkbox:     input#privacy
-#   - Botón submit: form[action="/confirm"] button[type="submit"]
+# Automatización principal (con warm page)
 # ---------------------------------------------------------------------------
 async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
-    ctx: BrowserContext | None = None
+    is_cold = False
+    start = time.time()
     try:
-        ctx = await _new_context()
-        page = await ctx.new_page()
-
-        # ── 1. Navegar a la página de canje ─────────────────────────────
-        logger.info("Navegando a %s", REDEEM_URL)
-        await page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-        logger.info("Página cargada, esperando scripts...")
-        await asyncio.sleep(2)  # Cloudflare Rocket Loader necesita tiempo
+        page, is_cold = await _get_page_for_request()
+        elapsed = time.time() - start
+        logger.info("Página lista en %.1fs (%s)", elapsed, "cold" if is_cold else "warm")
 
         # ── 2. Ingresar el PIN ────────────────────────────────────────
         logger.info("Ingresando PIN...")
@@ -373,24 +426,28 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             message="Error de automatización",
             details=str(exc),
         )
-    finally:
-        if ctx:
-            await ctx.close()
 
 
 # ---------------------------------------------------------------------------
-# Endpoint de la API
+# Endpoint de la API (con lock para serializar requests + recalentar página)
 # ---------------------------------------------------------------------------
 @app.post("/redeem", response_model=RedeemResponse)
 async def redeem_pin(data: RedeemRequest):
     logger.info("Petición de canje recibida para player_id=%s", data.player_id)
-    result = await automate_redeem(data)
+    async with _warm_lock:  # Solo 1 canje a la vez
+        result = await automate_redeem(data)
+        # Recalentar página para el siguiente request (en background)
+        asyncio.create_task(_reset_warm_page())
     return result
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "browser_ready": _browser is not None}
+    return {
+        "status": "ok",
+        "browser_ready": _browser is not None,
+        "warm_page_ready": _warm_ready,
+    }
 
 
 # ---------------------------------------------------------------------------
