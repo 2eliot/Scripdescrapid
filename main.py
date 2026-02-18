@@ -316,45 +316,67 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
-        # ── 8. Clic en botón final de canje ──────────────────────────
-        # Forzar habilitación de todos los botones de submit (pueden estar disabled)
+        # ── 8. Marcar TODOS los checkboxes + habilitar botones via JS ──
+        logger.info("Marcando checkboxes de términos y habilitando botones...")
         await page.evaluate("""() => {
+            // Marcar TODOS los checkboxes no marcados (privacy, terms, etc.)
+            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                if (!cb.checked) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', {bubbles: true}));
+                    cb.dispatchEvent(new Event('click', {bubbles: true}));
+                }
+            });
+            // Habilitar TODOS los botones disabled
             document.querySelectorAll('button[disabled], input[type="submit"][disabled]')
                 .forEach(b => b.removeAttribute('disabled'));
         }""")
+        await asyncio.sleep(0.3)  # Dejar que el JS de la página reaccione
 
+        # ── 9. Clic en botón final de canje ──────────────────────────
         logger.info("Buscando botón de canje final...")
         redeem_btn = page.locator(
             '#btn-confirm,'
+            '#btn-redeem,'
             'button:has-text("Resgatar"),'
             'button:has-text("Canjear"),'
             'button:has-text("Redeem"),'
             'button:has-text("Confirmar"),'
-            'form[action="/confirm"] button[type="submit"]'
+            'form[action="/confirm"] button[type="submit"],'
+            'button.btn-redeem'
         ).first
 
         if await redeem_btn.count() > 0:
+            # Forzar habilitación directa del botón encontrado
+            await redeem_btn.evaluate("el => el.removeAttribute('disabled')")
             logger.info("Haciendo clic en botón de canje final...")
-            await redeem_btn.click(timeout=5000)
+            await redeem_btn.click(timeout=10_000)
         else:
-            # Fallback: submit del form de confirmación
-            logger.info("Buscando form[action=/confirm] para submit...")
-            confirm_form = page.locator('form[action="/confirm"]')
-            if await confirm_form.count() > 0:
-                submit_btn = confirm_form.locator('button, input[type="submit"]').first
-                if await submit_btn.count() > 0:
-                    await submit_btn.click()
-                else:
-                    logger.warning("No se encontró botón de submit en form /confirm")
-                    return RedeemResponse(
-                        success=False,
-                        message="No se encontró botón de canje final",
-                        details=page_text[:300],
-                    )
-            else:
+            # Fallback: hacer submit via JS del primer form visible
+            logger.info("Botón no encontrado, intentando submit via JS...")
+            submitted = await page.evaluate("""() => {
+                // Buscar botón por texto
+                const btns = [...document.querySelectorAll('button, input[type="submit"]')];
+                for (const b of btns) {
+                    const txt = (b.textContent || b.value || '').toLowerCase();
+                    if (txt.includes('canjear') || txt.includes('resgatar') || 
+                        txt.includes('redeem') || txt.includes('confirmar')) {
+                        b.removeAttribute('disabled');
+                        b.click();
+                        return 'clicked: ' + txt.trim();
+                    }
+                }
+                // Último recurso: submit del form
+                const form = document.querySelector('form[action*="confirm"]') || 
+                             document.querySelector('form');
+                if (form) { form.submit(); return 'form.submit'; }
+                return null;
+            }""")
+            logger.info("Fallback submit result: %s", submitted)
+            if not submitted:
                 return RedeemResponse(
                     success=False,
-                    message="No se encontró formulario de confirmación",
+                    message="No se encontró botón de canje final",
                     details=page_text[:300],
                 )
 
