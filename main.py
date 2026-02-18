@@ -254,9 +254,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             const idEl = document.querySelector('#GameAccountId');
             if (idEl) { idEl.value = playerId; idEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-            // Checkbox privacidad
-            const cb = document.querySelector('#privacy');
-            if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', {bubbles:true})); }
+            // NO tocar checkbox aquí — se marca con Playwright trusted click en paso 8
 
             return !!(nameEl && bornEl && idEl);
         }""", {"name": data.full_name, "born": data.birth_date,
@@ -316,50 +314,50 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
-        # ── 8. Marcar checkboxes (términos y privacidad) ──────────────
-        logger.info("Marcando checkboxes de términos...")
+        # ── 8. Marcar checkboxes con TRUSTED click de Playwright ─────
+        # IMPORTANTE: NO usar JS para marcar checkboxes. El framework de la
+        # página solo registra clicks reales del navegador.
+        logger.info("Marcando checkboxes de términos (trusted click)...")
 
-        # Primero: intentar click Playwright en checkboxes estándar
+        # Primero: forzar UNCHECK via JS para que Playwright pueda hacer click
+        # (el paso 4 de form fill ya no toca checkboxes, pero por seguridad)
+        await page.evaluate("""() => {
+            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.checked = false;
+            });
+        }""")
+
         all_checkboxes = page.locator('input[type="checkbox"]')
         cb_count = await all_checkboxes.count()
         logger.info("Checkboxes encontrados: %d", cb_count)
         for i in range(cb_count):
             cb = all_checkboxes.nth(i)
             try:
-                if await cb.is_visible() and not await cb.is_checked():
+                is_vis = await cb.is_visible()
+                cb_id = await cb.get_attribute("id") or f"idx{i}"
+                if is_vis:
                     await cb.click(timeout=3000)
-                    logger.info("Checkbox %d marcado via Playwright", i)
-                elif not await cb.is_visible():
-                    # Click en el label asociado si el checkbox está oculto
-                    cb_id = await cb.get_attribute("id")
-                    if cb_id:
-                        label = page.locator(f'label[for="{cb_id}"]')
-                        if await label.count() > 0 and await label.is_visible():
-                            await label.click(timeout=3000)
-                            logger.info("Checkbox %d marcado via label (id=%s)", i, cb_id)
+                    logger.info("Checkbox %d (%s) marcado via Playwright click", i, cb_id)
+                else:
+                    # Checkbox oculto: intentar click en su label
+                    label = page.locator(f'label[for="{cb_id}"]')
+                    if await label.count() > 0 and await label.is_visible():
+                        await label.click(timeout=3000)
+                        logger.info("Checkbox %d (%s) marcado via label click", i, cb_id)
+                    else:
+                        # Último recurso: forzar click via JS
+                        await cb.evaluate("el => { el.click(); }")
+                        logger.info("Checkbox %d (%s) marcado via JS el.click()", i, cb_id)
             except Exception as e:
-                logger.warning("Checkbox %d falló: %s", i, e)
+                logger.warning("Checkbox %d (%s) falló: %s", i, cb_id, e)
 
-        # Segundo: marcar via JS como fallback (custom checkboxes, styled divs, etc.)
-        cb_js_result = await page.evaluate("""() => {
-            let marked = 0;
-            // Checkboxes estándar
-            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', {bubbles:true})); marked++; }
-            });
-            // Custom checkbox containers (divs/spans con role=checkbox)
-            document.querySelectorAll('[role="checkbox"]').forEach(el => {
-                if (el.getAttribute('aria-checked') !== 'true') {
-                    el.click(); marked++;
-                }
-            });
-            // Labels de checkbox que pueden necesitar click
-            document.querySelectorAll('.checkbox-label, .custom-checkbox, .terms-checkbox').forEach(el => {
-                el.click(); marked++;
-            });
-            return marked;
+        # Verificar estado final de checkboxes
+        cb_states = await page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('input[type="checkbox"]')).map(cb => ({
+                id: cb.id, checked: cb.checked, visible: cb.offsetParent !== null
+            }));
         }""")
-        logger.info("Checkboxes marcados via JS fallback: %d", cb_js_result)
+        logger.info("Estado checkboxes tras click: %s", cb_states)
 
         await asyncio.sleep(0.5)
 
