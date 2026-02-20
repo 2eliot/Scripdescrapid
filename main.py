@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -24,11 +25,59 @@ _redeem_lock = asyncio.Lock()  # Serializar canjes (1 a la vez)
 REDEEM_URL = "https://redeem.hype.games/"
 TIMEOUT_MS = 30_000
 
+# Keywords extraídas como constantes (evita recrear listas en cada request)
+PIN_ERROR_KEYWORDS = [
+    "already been redeemed", "already been used",
+    "invalid pin", "pin inválido", "pin inv",
+    "já foi utilizado", "pin not found",
+    "código inválido", "invalid code",
+    "pin ya fue", "ya fue canjeado",
+    "not valid", "não é válido",
+    "já foi resgatado", "expirado", "expired",
+]
+
+SUCCESS_KEYWORDS = [
+    "successfully redeemed", "canjeado con éxito",
+    "resgatado com sucesso", "congratulations",
+    "canjeo exitoso", "fue canjeado",
+    "parabéns", "felicidades",
+    "your order has been", "pedido foi",
+]
+
+FORM_KEYWORDS = [
+    "nome completo", "nombre completo", "full name",
+    "gameaccountid", "id do jogador", "id de usuario",
+]
+
+STILL_ON_FORM_KEYWORDS = [
+    "editar dados", "editar datos", "edit data",
+    "canjear ahora", "resgatar agora", "redeem now",
+    "insira seu pin", "ingrese su pin",
+]
+
+CONFIRM_ERROR_KEYWORDS = [
+    "error", "erro", "failed", "invalid", "expired",
+    "falhou", "falló", "tente novamente", "try again",
+]
+
 BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-translate",
+    "--disable-component-update",
+    "--no-first-run",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-ipc-flooding-protection",
+    "--js-flags=--max-old-space-size=256",
+    "--single-process",
 ]
 
 
@@ -116,15 +165,18 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
     try:
         await _ensure_browser()
         ctx = await _browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1024, "height": 600},
             locale="pt-BR",
         )
+        # Bloquear imágenes, fonts y media para ahorrar RAM y ancho de banda
+        await ctx.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}", lambda route: route.abort())
+        await ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "font", "media") else route.continue_())
         page = await ctx.new_page()
 
         # ── 1. Navegar (networkidle para que reCAPTCHA v3 cargue) ──────
         logger.info("Navegando a %s", REDEEM_URL)
         await page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-        await asyncio.sleep(2)  # Cloudflare Rocket Loader
+        await asyncio.sleep(1)  # Cloudflare Rocket Loader
         elapsed = time.time() - start
         logger.info("Página cargada en %.1fs", elapsed)
 
@@ -169,7 +221,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             )
             if recaptcha_ready:
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         logger.info("reCAPTCHA disponible: %s", recaptcha_ready)
 
         # ── 2. Ingresar el PIN ────────────────────────────────────────
@@ -186,7 +238,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             disabled = await btn_validate.get_attribute("disabled")
             if disabled is None:
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.15)
 
         # Clic en Verificar e interceptar la respuesta AJAX de /validate
         logger.info("Haciendo clic en Verificar (interceptando /validate)...")
@@ -219,16 +271,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         lower_text = page_text.lower()
         logger.info("Texto de página (200 chars): %s", page_text[:200].replace("\n", " "))
 
-        pin_error_keywords = [
-            "already been redeemed", "already been used",
-            "invalid pin", "pin inválido", "pin inv",
-            "já foi utilizado", "pin not found",
-            "código inválido", "invalid code",
-            "pin ya fue", "ya fue canjeado",
-            "not valid", "não é válido",
-            "já foi resgatado", "expirado", "expired",
-        ]
-        for kw in pin_error_keywords:
+        for kw in PIN_ERROR_KEYWORDS:
             if kw.lower() in lower_text:
                 logger.warning("Error de PIN detectado: %s", kw)
                 return RedeemResponse(
@@ -245,9 +288,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         
         if not card_back_html or "GameAccountId" not in card_back_html:
             # Tal vez la página no hizo flip. Verificar con texto general
-            form_keywords = ["nome completo", "nombre completo", "full name",
-                             "gameaccountid", "id do jogador", "id de usuario"]
-            if not any(kw in lower_text for kw in form_keywords):
+            if not any(kw in lower_text for kw in FORM_KEYWORDS):
                 snippet = page_text[:500].strip()
                 return RedeemResponse(
                     success=False,
@@ -288,7 +329,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             opt_count = await country_sel.evaluate("el => el.options.length")
             if opt_count > 1:  # >1 porque la primera es el placeholder
                 break
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         logger.info("Opciones de país cargadas: %d", opt_count)
 
         # Seleccionar país via Playwright select_option (trusted, dispara events nativos)
@@ -386,7 +427,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("No se pudo parsear respuesta validate/account: %s", e)
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
@@ -435,7 +476,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         }""")
         logger.info("Estado checkboxes tras click: %s", cb_states)
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
         # ── 9. Clic en botón final de canje ──────────────────────────
 
@@ -672,10 +713,10 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # Esperar navegación o cambio de página
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            await page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
         # Capturar URL actual
         url_after = page.url
@@ -690,14 +731,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Combinar texto de página + body de /confirm para buscar éxito
         combined_text = (lower_text + " " + confirm_body.lower()).strip()
 
-        success_keywords = [
-            "successfully redeemed", "canjeado con éxito",
-            "resgatado com sucesso", "congratulations",
-            "canjeo exitoso", "fue canjeado",
-            "parabéns", "felicidades",
-            "your order has been", "pedido foi",
-        ]
-        for kw in success_keywords:
+        for kw in SUCCESS_KEYWORDS:
             if kw in combined_text:
                 logger.info("¡Canje exitoso confirmado! keyword='%s' Jugador: %s", kw, player_name)
                 return RedeemResponse(
@@ -712,8 +746,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             # Intentar parsear como JSON primero
             confirm_json = None
             try:
-                import json as _json
-                confirm_json = _json.loads(confirm_body)
+                confirm_json = json.loads(confirm_body)
             except Exception:
                 pass
 
@@ -740,10 +773,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             else:
                 # Body no es JSON, buscar keywords de error
                 confirm_lower = confirm_body.lower()
-                error_in_confirm = any(e in confirm_lower for e in [
-                    "error", "erro", "failed", "invalid", "expired",
-                    "falhou", "falló", "tente novamente", "try again",
-                ])
+                error_in_confirm = any(e in confirm_lower for e in CONFIRM_ERROR_KEYWORDS)
                 if not error_in_confirm:
                     logger.info("Canje exitoso (/confirm HTTP 200, sin errores en body). Jugador: %s", player_name)
                     return RedeemResponse(
@@ -756,12 +786,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     logger.warning("Error en body de /confirm: %s", confirm_body[:300])
 
         # Indicadores de que el formulario sigue ahí (NO se canjeó)
-        still_on_form_keywords = [
-            "editar dados", "editar datos", "edit data",
-            "canjear ahora", "resgatar agora", "redeem now",
-            "insira seu pin", "ingrese su pin",
-        ]
-        form_still_visible = any(kw in lower_text for kw in still_on_form_keywords)
+        form_still_visible = any(kw in lower_text for kw in STILL_ON_FORM_KEYWORDS)
         if form_still_visible:
             logger.warning("Página sigue en formulario - canje NO se completó")
             return RedeemResponse(
@@ -813,7 +838,23 @@ async def redeem_pin(data: RedeemRequest):
 async def health():
     return {
         "status": "ok",
-        "browser_ready": _browser is not None,
+        "browser_ready": _browser is not None and _browser.is_connected(),
+    }
+
+
+@app.get("/metrics")
+async def metrics():
+    """Endpoint para monitorear uso de recursos en el VPS."""
+    import os
+    import psutil
+    proc = psutil.Process(os.getpid())
+    mem = proc.memory_info()
+    return {
+        "rss_mb": round(mem.rss / 1024 / 1024, 1),
+        "vms_mb": round(mem.vms / 1024 / 1024, 1),
+        "cpu_percent": proc.cpu_percent(interval=0.1),
+        "threads": proc.num_threads(),
+        "browser_connected": _browser is not None and _browser.is_connected(),
     }
 
 
