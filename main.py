@@ -178,8 +178,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # ── 1. Navegar (networkidle para que reCAPTCHA v3 cargue) ──────
         logger.info("Navegando a %s", REDEEM_URL)
-        await page.goto(REDEEM_URL, wait_until="networkidle", timeout=TIMEOUT_MS)
-        await asyncio.sleep(1)  # Cloudflare Rocket Loader
+        await page.goto(REDEEM_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        await asyncio.sleep(0.5)  # Cloudflare Rocket Loader
         elapsed = time.time() - start
         logger.info("Página cargada en %.1fs", elapsed)
 
@@ -714,12 +714,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 details="Ambos intentos (Playwright click + JS submit con reCAPTCHA) fallaron",
             )
 
-        # Esperar navegación o cambio de página
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-        await asyncio.sleep(1)
+        # Breve espera para que la página procese la respuesta
+        await asyncio.sleep(0.3)
 
         # Capturar URL actual
         url_after = page.url
