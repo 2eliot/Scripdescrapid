@@ -77,7 +77,6 @@ BROWSER_ARGS = [
     "--disable-renderer-backgrounding",
     "--disable-ipc-flooding-protection",
     "--js-flags=--max-old-space-size=256",
-    "--single-process",
 ]
 
 
@@ -169,8 +168,12 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             locale="pt-BR",
         )
         # Bloquear imágenes, fonts y media para ahorrar RAM y ancho de banda
-        await ctx.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf,eot}", lambda route: route.abort())
-        await ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "font", "media") else route.continue_())
+        async def _block_resources(route):
+            if route.request.resource_type in ("image", "font", "media"):
+                await route.abort()
+            else:
+                await route.continue_()
+        await ctx.route("**/*", _block_resources)
         page = await ctx.new_page()
 
         # ── 1. Navegar (networkidle para que reCAPTCHA v3 cargue) ──────
