@@ -60,6 +60,14 @@ CONFIRM_ERROR_KEYWORDS = [
     "falhou", "falló", "tente novamente", "try again",
 ]
 
+# Dominios de tracking a bloquear (no afectan reCAPTCHA ni formulario)
+_BLOCKED_DOMAINS = (
+    "google-analytics.com", "googletagmanager.com",
+    "facebook.net", "facebook.com", "fbcdn.net",
+    "hotjar.com", "doubleclick.net", "googlesyndication.com",
+    "cloudflareinsights.com", "clarity.ms", "connect.facebook.net",
+)
+
 BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -167,21 +175,27 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             viewport={"width": 1024, "height": 600},
             locale="pt-BR",
         )
-        # Bloquear imágenes, fonts y media para ahorrar RAM y ancho de banda
+        # Bloquear imágenes, fonts, media y dominios de tracking
         async def _block_resources(route):
-            if route.request.resource_type in ("image", "font", "media"):
+            req = route.request
+            if req.resource_type in ("image", "font", "media"):
                 await route.abort()
-            else:
-                await route.continue_()
+                return
+            url = req.url
+            for dom in _BLOCKED_DOMAINS:
+                if dom in url:
+                    await route.abort()
+                    return
+            await route.continue_()
         await ctx.route("**/*", _block_resources)
         page = await ctx.new_page()
 
         # ── 1. Navegar (networkidle para que reCAPTCHA v3 cargue) ──────
         logger.info("Navegando a %s", REDEEM_URL)
         await page.goto(REDEEM_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-        await asyncio.sleep(0.5)  # Cloudflare Rocket Loader
+        await page.wait_for_selector("#pininput", state="visible", timeout=TIMEOUT_MS)
         elapsed = time.time() - start
-        logger.info("Página cargada en %.1fs", elapsed)
+        logger.info("Página lista en %.1fs", elapsed)
 
         # ── Cerrar cookie consent popup si existe ──────────────────────
         try:
@@ -224,7 +238,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             )
             if recaptcha_ready:
                 break
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)
         logger.info("reCAPTCHA disponible: %s", recaptcha_ready)
 
         # ── 2. Ingresar el PIN ────────────────────────────────────────
@@ -267,7 +281,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         try:
             await page.locator(".card.back").wait_for(state="visible", timeout=15_000)
         except Exception:
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
 
         # ── 3. Verificar errores de PIN ────────────────────────────────
         page_text = await page.inner_text("body")
@@ -332,7 +346,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             opt_count = await country_sel.evaluate("el => el.options.length")
             if opt_count > 1:  # >1 porque la primera es el placeholder
                 break
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.1)
         logger.info("Opciones de país cargadas: %d", opt_count)
 
         # Seleccionar país via Playwright select_option (trusted, dispara events nativos)
@@ -430,7 +444,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("No se pudo parsear respuesta validate/account: %s", e)
 
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
@@ -471,41 +485,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("Checkbox %d (%s) falló: %s", i, cb_id, e)
 
-        # Verificar estado final de checkboxes
-        cb_states = await page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('input[type="checkbox"]')).map(cb => ({
-                id: cb.id, checked: cb.checked, visible: cb.offsetParent !== null
-            }));
-        }""")
-        logger.info("Estado checkboxes tras click: %s", cb_states)
-
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
 
         # ── 9. Clic en botón final de canje ──────────────────────────
-
-        # Diagnosticar estado de TODOS los campos del formulario antes de submit
-        form_state = await page.evaluate("""() => {
-            const fields = {};
-            document.querySelectorAll('input, select, textarea').forEach(el => {
-                const key = el.id || el.name || el.tagName;
-                if (el.type === 'checkbox') fields[key] = {type:'checkbox', checked:el.checked, value:el.value};
-                else if (el.tagName === 'SELECT') fields[key] = {type:'select', value:el.value, text:el.options[el.selectedIndex]?.text};
-                else fields[key] = {type:el.type, value:el.value?.substring(0,50)};
-            });
-            return fields;
-        }""")
-        logger.info("Estado formulario antes de submit: %s", form_state)
-
-        # Interceptar request body de /confirm para ver qué se envía
-        confirm_request_body = None
-        async def capture_confirm_request(route):
-            nonlocal confirm_request_body
-            req = route.request
-            if "/confirm" in req.url:
-                confirm_request_body = req.post_data
-                logger.info("REQUEST a /confirm - method=%s body=%s", req.method, (confirm_request_body or '')[:500])
-            await route.continue_()
-        await page.route("**/confirm**", capture_confirm_request)
 
         logger.info("Habilitando y buscando botón de canje final...")
 
@@ -715,7 +697,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             )
 
         # Breve espera para que la página procese la respuesta
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.1)
 
         # Capturar URL actual
         url_after = page.url
