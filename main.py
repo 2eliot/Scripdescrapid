@@ -248,15 +248,19 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         except Exception as e:
             logger.warning("No se interceptó /validate: %s", e)
 
-        # ── 5. Esperar formulario (#GameAccountId en DOM, no animación CSS) ──
+        # ── 5. Esperar formulario: DOM primero, luego animación CSS ──
         try:
             await page.wait_for_selector("#GameAccountId", state="attached", timeout=10_000)
         except Exception:
-            # Fallback: esperar .card.back visible
-            try:
-                await page.locator(".card.back").wait_for(state="visible", timeout=5_000)
-            except Exception:
-                await asyncio.sleep(0.5)
+            pass
+        # Esperar a que .card.back sea VISIBLE (animación flip ~0.3-0.5s)
+        # Sin esto, checkboxes/botones no son clickeables
+        try:
+            await page.locator(".card.back").first.wait_for(state="visible", timeout=5_000)
+            logger.info("Card.back visible en %.1fs", time.time() - start)
+        except Exception:
+            logger.warning("Card.back no visible, esperando 0.5s...")
+            await asyncio.sleep(0.5)
 
         # ── 6. Verificar errores de PIN ───────────────────────────────
         page_text = await page.inner_text("body")
@@ -272,10 +276,12 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 )
 
         # Verificar que el formulario apareció
-        card_back = page.locator(".card.back")
+        card_back = page.locator(".card.back").first
         card_back_html = ""
-        if await card_back.count() > 0:
+        try:
             card_back_html = await card_back.inner_html()
+        except Exception:
+            pass
         if not card_back_html or "GameAccountId" not in card_back_html:
             if not any(kw in lower_text for kw in FORM_KEYWORDS):
                 return RedeemResponse(
