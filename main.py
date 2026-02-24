@@ -79,18 +79,6 @@ BROWSER_ARGS = [
     "--js-flags=--max-old-space-size=256",
 ]
 
-# Tipos de recurso a bloquear (ahorra ancho de banda y RAM)
-_BLOCKED_TYPES = frozenset(("image", "font", "media"))
-
-# Dominios de rastreo que retrasan la carga sin aportar al flujo de reCAPTCHA
-_BLOCKED_DOMAINS = (
-    "google-analytics.com", "googletagmanager.com",
-    "facebook.net", "facebook.com", "fbcdn.net",
-    "hotjar.com", "doubleclick.net", "googlesyndication.com",
-    "cloudflareinsights.com", "clarity.ms", "connect.facebook.net",
-    "analytics.", "adservice.google",
-)
-
 
 async def _ensure_browser():
     """Garantiza que el browser esté vivo. Lo reinicia si crasheó."""
@@ -168,8 +156,7 @@ class RedeemResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Automatización principal OPTIMIZADA (contexto fresco por request)
-# Target: 3-4 s por canje (antes ~8 s)
+# Automatización principal (contexto fresco por request)
 # ---------------------------------------------------------------------------
 async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
     ctx: BrowserContext | None = None
@@ -180,335 +167,460 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             viewport={"width": 1024, "height": 600},
             locale="pt-BR",
         )
-
-        # ── Bloqueo refinado: tipos + dominios de rastreo ─────────────
+        # Bloquear imágenes, fonts y media para ahorrar RAM y ancho de banda
         async def _block_resources(route):
-            req = route.request
-            if req.resource_type in _BLOCKED_TYPES:
+            if route.request.resource_type in ("image", "font", "media"):
                 await route.abort()
-                return
-            url = req.url
-            for dom in _BLOCKED_DOMAINS:
-                if dom in url:
-                    await route.abort()
-                    return
-            await route.continue_()
+            else:
+                await route.continue_()
         await ctx.route("**/*", _block_resources)
         page = await ctx.new_page()
 
-        # ── 1. Navegar con "commit" + esperar selector del PIN ────────
+        # ── 1. Navegar (networkidle para que reCAPTCHA v3 cargue) ──────
         logger.info("Navegando a %s", REDEEM_URL)
-        await page.goto(REDEEM_URL, wait_until="commit", timeout=TIMEOUT_MS)
-        await page.wait_for_selector("#pininput", state="visible", timeout=TIMEOUT_MS)
-        logger.info("Página lista en %.1fs", time.time() - start)
+        await page.goto(REDEEM_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+        await asyncio.sleep(0.5)  # Cloudflare Rocket Loader
+        elapsed = time.time() - start
+        logger.info("Página cargada en %.1fs", elapsed)
 
-        # ── 2. Llenar PIN + dismiss cookies en paralelo via JS ────────
-        await page.evaluate("""(pin) => {
-            // Llenar PIN inmediatamente
-            const inp = document.querySelector('#pininput');
-            if (inp) {
-                inp.value = pin;
-                inp.dispatchEvent(new Event('input', {bubbles:true}));
-                inp.dispatchEvent(new Event('change', {bubbles:true}));
-            }
-            // Dismiss cookies
-            document.querySelectorAll(
-                '[class*="cookie"],[class*="consent"],[id*="cookie"],[id*="consent"],' +
-                '[class*="Cookie"],[class*="Consent"],.cc-window,.cc-banner,#onetrust-banner-sdk'
-            ).forEach(el => el.remove());
-            const btns = document.querySelectorAll('button, a.btn, a[role="button"]');
-            for (const b of btns) {
-                const t = b.textContent.trim().toLowerCase();
-                if (['aceptar','accept','aceitar','accept all','aceptar todo'].includes(t))
-                    { b.click(); break; }
-            }
-        }""", data.pin_key)
+        # ── Cerrar cookie consent popup si existe ──────────────────────
+        try:
+            cookie_dismissed = await page.evaluate("""() => {
+                // Buscar botones de aceptar cookies
+                const selectors = [
+                    'button[id*="accept"]', 'button[id*="Accept"]',
+                    'a[id*="accept"]', 'a[id*="Accept"]',
+                    '.cc-accept', '.cc-dismiss',
+                    'button.accept-cookies',
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { el.click(); return 'clicked: ' + sel; }
+                }
+                // Buscar por texto en botones
+                const allBtns = document.querySelectorAll('button, a.btn, a[role="button"]');
+                for (const btn of allBtns) {
+                    const txt = btn.textContent.trim().toLowerCase();
+                    if (txt === 'aceptar' || txt === 'accept' || txt === 'aceitar' ||
+                        txt === 'accept all' || txt === 'aceptar todo' || txt === 'aceptar todas') {
+                        btn.click(); return 'clicked_text: ' + txt;
+                    }
+                }
+                // Eliminar overlays de cookies por fuerza
+                document.querySelectorAll('[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]').forEach(el => {
+                    el.remove();
+                });
+                return 'no_btn_found_overlays_removed';
+            }""")
+            logger.info("Cookie popup: %s", cookie_dismissed)
+        except Exception as e:
+            logger.warning("Cookie popup dismiss falló: %s", e)
 
-        # ── 3. Esperar btn-validate habilitado (reCAPTCHA carga en fondo) ──
+        # Esperar a que reCAPTCHA esté disponible
+        recaptcha_ready = False
+        for _ in range(20):
+            recaptcha_ready = await page.evaluate(
+                "() => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function'"
+            )
+            if recaptcha_ready:
+                break
+            await asyncio.sleep(0.3)
+        logger.info("reCAPTCHA disponible: %s", recaptcha_ready)
+
+        # ── 2. Ingresar el PIN ────────────────────────────────────────
+        logger.info("Ingresando PIN...")
+        pin_input = page.locator("#pininput")
+        await pin_input.wait_for(state="visible", timeout=TIMEOUT_MS)
+        await pin_input.fill(data.pin_key)
+
+        # Esperar a que el botón se habilite
+        logger.info("Esperando que botón Verificar se habilite...")
         btn_validate = page.locator("#btn-validate")
-        for _ in range(40):
+        await btn_validate.wait_for(state="visible", timeout=TIMEOUT_MS)
+        for _ in range(30):
             disabled = await btn_validate.get_attribute("disabled")
             if disabled is None:
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.15)
 
-        # ── 4. Click Verificar (force) + interceptar /validate ────────
-        logger.info("Click Verificar PIN...")
+        # Clic en Verificar e interceptar la respuesta AJAX de /validate
+        logger.info("Haciendo clic en Verificar (interceptando /validate)...")
+        validate_response = None
         try:
             async with page.expect_response(
                 lambda r: "/validate" in r.url and "account" not in r.url,
                 timeout=TIMEOUT_MS
             ) as resp_info:
-                await btn_validate.click(force=True)
+                await btn_validate.click()
             validate_response = await resp_info.value
-            logger.info("Respuesta /validate: HTTP %s", validate_response.status)
-            if validate_response.status >= 400:
+            validate_status = validate_response.status
+            logger.info("Respuesta /validate: HTTP %s", validate_status)
+            if validate_status >= 400:
                 body = await validate_response.text()
                 logger.warning("Error en /validate: %s", body[:300])
         except Exception as e:
-            logger.warning("No se interceptó /validate: %s", e)
+            logger.warning("No se pudo interceptar /validate: %s", e)
+            # Continuar de todos modos
 
-        # ── 5. Esperar formulario: DOM primero, luego animación CSS ──
+        # Esperar a que .card.back aparezca (el flip real del formulario)
+        logger.info("Esperando flip de tarjeta (.card.back visible)...")
         try:
-            await page.wait_for_selector("#GameAccountId", state="attached", timeout=10_000)
+            await page.locator(".card.back").wait_for(state="visible", timeout=15_000)
         except Exception:
-            pass
-        # Esperar a que .card.back sea VISIBLE (animación flip ~0.3-0.5s)
-        # Sin esto, checkboxes/botones no son clickeables
-        try:
-            await page.locator(".card.back").first.wait_for(state="visible", timeout=5_000)
-            logger.info("Card.back visible en %.1fs", time.time() - start)
-        except Exception:
-            logger.warning("Card.back no visible, esperando 0.5s...")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2)
 
-        # ── 6. Verificar errores de PIN ───────────────────────────────
+        # ── 3. Verificar errores de PIN ────────────────────────────────
         page_text = await page.inner_text("body")
         lower_text = page_text.lower()
+        logger.info("Texto de página (200 chars): %s", page_text[:200].replace("\n", " "))
 
         for kw in PIN_ERROR_KEYWORDS:
             if kw.lower() in lower_text:
-                logger.warning("Error de PIN: %s", kw)
+                logger.warning("Error de PIN detectado: %s", kw)
                 return RedeemResponse(
                     success=False,
                     message="Error de PIN",
                     details=f"El sitio devolvió un error: '{kw}'",
                 )
 
-        # Verificar que el formulario apareció
-        card_back = page.locator(".card.back").first
+        # Verificar que el formulario apareció en .card.back
+        card_back = page.locator(".card.back")
         card_back_html = ""
-        try:
+        if await card_back.count() > 0:
             card_back_html = await card_back.inner_html()
-        except Exception:
-            pass
+        
         if not card_back_html or "GameAccountId" not in card_back_html:
+            # Tal vez la página no hizo flip. Verificar con texto general
             if not any(kw in lower_text for kw in FORM_KEYWORDS):
+                snippet = page_text[:500].strip()
                 return RedeemResponse(
                     success=False,
                     message="Formulario no apareció después de validar PIN",
-                    details=page_text[:500].strip(),
+                    details=snippet,
                 )
-        logger.info("Formulario detectado en %.1fs", time.time() - start)
 
-        # ── 7. INYECCIÓN MASIVA: exactamente como pin_redeemer.py ─────
-        # Usa document.getElementById (NO .card.back), nativeInputValueSetter,
-        # scrollIntoView, focus, blur, keyup — replicando lo que funciona en producción
-        country_codes = {
-            'chile': 'CL', 'argentina': 'AR', 'colombia': 'CO', 'mexico': 'MX',
-            'méxico': 'MX', 'peru': 'PE', 'perú': 'PE', 'venezuela': 'VE',
-            'ecuador': 'EC', 'bolivia': 'BO', 'uruguay': 'UY', 'paraguay': 'PY',
-            'brasil': 'BR', 'brazil': 'BR', 'panama': 'PA', 'panamá': 'PA',
-            'costa rica': 'CR', 'guatemala': 'GT', 'honduras': 'HN',
-            'el salvador': 'SV', 'nicaragua': 'NI', 'cuba': 'CU',
-            'republica dominicana': 'DO', 'puerto rico': 'PR',
-        }
-        nac_code = country_codes.get(data.country.lower(), data.country)
+        logger.info("Formulario detectado en .card.back")
 
-        fill_result = await page.evaluate("""(data) => {
-            const results = [];
+        # ── 4. Llenar campos de texto via JS (instantáneo) ──────────
+        logger.info("Llenando campos de texto via JS...")
+        fill_ok = await page.evaluate("""(args) => {
+            const {name, born, playerId} = args;
 
-            function setVal(el, val) {
-                el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                el.focus();
-                // nativeInputValueSetter para bypass de frameworks reactivos
-                const nativeSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                nativeSetter.call(el, val);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-                const formItem = el.closest('.form-item');
-                if (formItem) formItem.classList.add('filled');
-            }
+            // Nombre
+            const nameEl = document.querySelector('#Name');
+            if (nameEl) { nameEl.value = name; nameEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-            // 1. Nombre (#Name)
-            const nameEl = document.getElementById('Name');
-            if (nameEl) { setVal(nameEl, data.name); results.push('Name: OK'); }
-            else results.push('Name: NOT_FOUND');
+            // Fecha de nacimiento
+            const bornEl = document.querySelector('#BornAt');
+            if (bornEl) { bornEl.value = born; bornEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-            // 2. Fecha (#BornAt)
-            const bornEl = document.getElementById('BornAt');
-            if (bornEl) { setVal(bornEl, data.born); results.push('Born: OK'); }
-            else results.push('Born: NOT_FOUND');
+            // Player ID
+            const idEl = document.querySelector('#GameAccountId');
+            if (idEl) { idEl.value = playerId; idEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
-            // 3. País (#NationalityAlphaCode) - código ISO directo
-            const nacSel = document.getElementById('NationalityAlphaCode');
-            if (nacSel) {
-                nacSel.scrollIntoView({ behavior: 'instant', block: 'center' });
-                nacSel.value = data.nac_code;
-                nacSel.dispatchEvent(new Event('change', { bubbles: true }));
-                results.push('Country: OK -> ' + data.nac_code);
-            } else results.push('Country: NOT_FOUND');
-
-            // 4. Player ID (#GameAccountId)
-            const gameEl = document.getElementById('GameAccountId');
-            if (gameEl) {
-                setVal(gameEl, data.playerId);
-                gameEl.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-                results.push('PlayerID: OK -> ' + data.playerId);
-            } else results.push('PlayerID: NOT_FOUND');
-
-            // 5. Checkbox (#privacy)
-            const privacyEl = document.getElementById('privacy');
-            if (privacyEl && !privacyEl.checked) {
-                privacyEl.click();
-                results.push('Checkbox: clicked -> ' + privacyEl.checked);
-            } else if (privacyEl) {
-                results.push('Checkbox: already checked');
-            }
-
-            // 6. Habilitar botón Verificar
-            const verifyBtn = document.getElementById('btn-verify');
-            if (verifyBtn) {
-                verifyBtn.removeAttribute('disabled');
-                results.push('Verify btn: enabled');
-            }
-
-            return results;
+            return !!(nameEl && bornEl && idEl);
         }""", {"name": data.full_name, "born": data.birth_date,
-               "playerId": data.player_id, "nac_code": nac_code})
-        logger.info("Fill (pin_redeemer style): %s", fill_result)
+               "playerId": data.player_id})
+        logger.info("Campos texto llenados: %s (nombre=%s, id=%s)",
+                     "OK" if fill_ok else "parcial", data.full_name, data.player_id)
 
-        await asyncio.sleep(0.08)
+        # ── 5. Seleccionar país con Playwright (trusted) ──────────
+        # Las opciones se cargan async desde /countries — esperar a que existan
+        country_sel = page.locator("#NationalityAlphaCode")
+        logger.info("Esperando opciones del select de país...")
+        for attempt in range(20):
+            opt_count = await country_sel.evaluate("el => el.options.length")
+            if opt_count > 1:  # >1 porque la primera es el placeholder
+                break
+            await asyncio.sleep(0.2)
+        logger.info("Opciones de país cargadas: %d", opt_count)
 
-        # ── 8. Click Verificar ID via JS + poll DOM (como pin_redeemer.py) ──
+        # Seleccionar país via Playwright select_option (trusted, dispara events nativos)
+        country_selected = False
+        country_name = data.country.lower()
+        try:
+            # Intentar por label parcial — obtener opciones y buscar match
+            options_info = await country_sel.evaluate("""(el) => {
+                return Array.from(el.options).map(o => ({value: o.value, text: o.text})).slice(0, 5);
+            }""")
+            logger.info("Primeras 5 opciones: %s", options_info)
+
+            # Buscar el value de la opción que contenga el nombre del país
+            target_value = await country_sel.evaluate("""(el, cn) => {
+                for (const opt of el.options) {
+                    if (opt.text.toLowerCase().includes(cn)) return opt.value;
+                }
+                return null;
+            }""", country_name)
+
+            if target_value:
+                await country_sel.select_option(value=target_value)
+                logger.info("País seleccionado via Playwright: value=%s", target_value)
+                country_selected = True
+            else:
+                logger.warning("No se encontró opción para país '%s'", data.country)
+        except Exception as e:
+            logger.warning("Error seleccionando país via Playwright: %s", e)
+
+        if not country_selected:
+            # Fallback: seleccionar Chile (CountryId=5 en los hidden fields)
+            logger.info("Fallback: seleccionando Chile...")
+            try:
+                target_value = await country_sel.evaluate("""(el) => {
+                    for (const opt of el.options) {
+                        if (opt.text.toLowerCase().includes('chile')) return opt.value;
+                    }
+                    // Si no hay Chile, seleccionar la primera opción no vacía
+                    for (const opt of el.options) {
+                        if (opt.value) return opt.value;
+                    }
+                    return null;
+                }""")
+                if target_value:
+                    await country_sel.select_option(value=target_value)
+                    logger.info("Chile seleccionado: value=%s", target_value)
+            except Exception as e:
+                logger.warning("Fallback país falló: %s", e)
+
+        # ── 6. Clic en botón VERIFICAR ID ────────────────────────────
+        # El JS llama a validate/account via AJAX que retorna {"Success":true,"Username":"NOMBRE"}
+        # Interceptamos esa respuesta para obtener el player_name directamente
         player_name = None
 
-        # Click #btn-verify via JS (document.getElementById, como pin_redeemer.py)
-        logger.info("Click Verificar ID via JS...")
+        # Forzar habilitación del botón verify (el JS de la página lo deja disabled
+        # si los eventos de validación no se dispararon correctamente con el fill via JS)
         await page.evaluate("""() => {
-            const btn = document.getElementById('btn-verify');
-            if (btn) {
-                btn.removeAttribute('disabled');
-                btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                btn.click();
-            }
+            const btns = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
+            btns.forEach(b => b.removeAttribute('disabled'));
         }""")
 
-        # Poll DOM esperando que #btn-redeem se habilite o nombre de jugador aparezca
-        # (exactamente como pin_redeemer.py paso 7.5)
-        redeem_ready = False
-        for attempt in range(20):  # Máximo 10 segundos
-            await asyncio.sleep(0.5)
+        logger.info("Buscando botón de verificar ID...")
+        verify_btn = page.locator(
+            '#btn-verify,'
+            'button:has-text("Verificar ID"),'
+            'button:has-text("Verify ID"),'
+            'button:has-text("Verificar Id"),'
+            '#btn-verify-account'
+        ).first
+        if await verify_btn.count() > 0:
+            logger.info("Haciendo clic en Verificar ID (interceptando respuesta AJAX)...")
 
-            check = await page.evaluate("""() => {
-                const redeemBtn = document.getElementById('btn-redeem');
-                const redeemData = document.querySelector('.redeem-data');
-                const playerName = document.getElementById('btn-player-game-data');
-                const errorEl = document.querySelector('.error-message, .alert-danger, .text-danger');
+            # Interceptar la respuesta de validate/account para obtener Username
+            async with page.expect_response(
+                lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
+            ) as response_info:
+                await verify_btn.click(timeout=5000)
 
-                // Error visible
-                if (errorEl && errorEl.offsetParent !== null && errorEl.textContent.trim().length > 5) {
-                    return { status: 'error', message: errorEl.textContent.trim(), player_name: '' };
-                }
+            try:
+                resp = await response_info.value
+                resp_json = await resp.json()
+                logger.info("Respuesta validate/account: %s", resp_json)
 
-                // Botón Canjear visible + datos del jugador
-                if (redeemBtn && redeemData && redeemData.style.display !== 'none') {
-                    const name = playerName ? playerName.textContent.trim() : '';
-                    return { status: 'ready', message: 'Player: ' + name, player_name: name };
-                }
+                if resp_json.get("Success"):
+                    player_name = resp_json.get("Username", "")
+                    logger.info("Player name desde AJAX: %s", player_name)
+                else:
+                    error_msg = resp_json.get("Message", "ID inválido")
+                    logger.warning("Error de ID: %s", error_msg)
+                    return RedeemResponse(
+                        success=False,
+                        message="Error de ID del jugador",
+                        details=error_msg,
+                    )
+            except Exception as e:
+                logger.warning("No se pudo parsear respuesta validate/account: %s", e)
 
-                // Verify sigue en loading
-                const verifyBtn = document.getElementById('btn-verify');
-                if (verifyBtn && verifyBtn.classList.contains('loading')) {
-                    return { status: 'loading', message: 'Verificando...', player_name: '' };
-                }
+            await asyncio.sleep(0.3)
+        else:
+            logger.warning("Botón Verificar ID no encontrado, continuando...")
 
-                return { status: 'waiting', message: 'Esperando...', player_name: '' };
-            }""")
+        # ── 8. Marcar checkboxes con TRUSTED click de Playwright ─────
+        # IMPORTANTE: NO usar JS para marcar checkboxes. El framework de la
+        # página solo registra clicks reales del navegador.
+        logger.info("Marcando checkboxes de términos (trusted click)...")
 
-            logger.info("Verify [%d]: %s - %s", attempt + 1, check['status'], check['message'])
+        # Primero: forzar UNCHECK via JS para que Playwright pueda hacer click
+        # (el paso 4 de form fill ya no toca checkboxes, pero por seguridad)
+        await page.evaluate("""() => {
+            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.checked = false;
+            });
+        }""")
 
-            if check['status'] == 'ready':
-                redeem_ready = True
-                player_name = check.get('player_name', '')
-                break
-            elif check['status'] == 'error':
-                return RedeemResponse(
-                    success=False,
-                    message="Error de ID del jugador",
-                    details=check['message'],
-                )
+        all_checkboxes = page.locator('input[type="checkbox"]')
+        cb_count = await all_checkboxes.count()
+        logger.info("Checkboxes encontrados: %d", cb_count)
+        for i in range(cb_count):
+            cb = all_checkboxes.nth(i)
+            try:
+                is_vis = await cb.is_visible()
+                cb_id = await cb.get_attribute("id") or f"idx{i}"
+                if is_vis:
+                    await cb.click(timeout=3000)
+                    logger.info("Checkbox %d (%s) marcado via Playwright click", i, cb_id)
+                else:
+                    # Checkbox oculto: intentar click en su label
+                    label = page.locator(f'label[for="{cb_id}"]')
+                    if await label.count() > 0 and await label.is_visible():
+                        await label.click(timeout=3000)
+                        logger.info("Checkbox %d (%s) marcado via label click", i, cb_id)
+                    else:
+                        # Último recurso: forzar click via JS
+                        await cb.evaluate("el => { el.click(); }")
+                        logger.info("Checkbox %d (%s) marcado via JS el.click()", i, cb_id)
+            except Exception as e:
+                logger.warning("Checkbox %d (%s) falló: %s", i, cb_id, e)
 
-        if not redeem_ready:
-            logger.warning("Timeout esperando verificación de ID")
+        # Verificar estado final de checkboxes
+        cb_states = await page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('input[type="checkbox"]')).map(cb => ({
+                id: cb.id, checked: cb.checked, visible: cb.offsetParent !== null
+            }));
+        }""")
+        logger.info("Estado checkboxes tras click: %s", cb_states)
 
-        # ── 10. Submit canje final ────────────────────────────────────
-        # Habilitar btn-redeem (puede haberse re-deshabilitado)
+        await asyncio.sleep(0.3)
+
+        # ── 9. Clic en botón final de canje ──────────────────────────
+
+        # Diagnosticar estado de TODOS los campos del formulario antes de submit
+        form_state = await page.evaluate("""() => {
+            const fields = {};
+            document.querySelectorAll('input, select, textarea').forEach(el => {
+                const key = el.id || el.name || el.tagName;
+                if (el.type === 'checkbox') fields[key] = {type:'checkbox', checked:el.checked, value:el.value};
+                else if (el.tagName === 'SELECT') fields[key] = {type:'select', value:el.value, text:el.options[el.selectedIndex]?.text};
+                else fields[key] = {type:el.type, value:el.value?.substring(0,50)};
+            });
+            return fields;
+        }""")
+        logger.info("Estado formulario antes de submit: %s", form_state)
+
+        # Interceptar request body de /confirm para ver qué se envía
+        confirm_request_body = None
+        async def capture_confirm_request(route):
+            nonlocal confirm_request_body
+            req = route.request
+            if "/confirm" in req.url:
+                confirm_request_body = req.post_data
+                logger.info("REQUEST a /confirm - method=%s body=%s", req.method, (confirm_request_body or '')[:500])
+            await route.continue_()
+        await page.route("**/confirm**", capture_confirm_request)
+
+        logger.info("Habilitando y buscando botón de canje final...")
+
+        confirm_ok = False
+        confirm_body = ""
+
+        # Eliminar cookie popup y overlays que bloquean clicks
+        await page.evaluate("""() => {
+            document.querySelectorAll(
+                '[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"], ' +
+                '[class*="Cookie"], [class*="Consent"], .cc-window, .cc-banner, #onetrust-banner-sdk'
+            ).forEach(el => el.remove());
+            // También remover cualquier overlay/backdrop
+            document.querySelectorAll('[class*="overlay"], [class*="backdrop"], [class*="modal"]').forEach(el => {
+                if (el.id !== 'btn-redeem' && !el.closest('.card')) el.remove();
+            });
+        }""")
+
+        # Habilitar btn-redeem via JS
         await page.evaluate("""() => {
             const btn = document.querySelector('#btn-redeem');
             if (btn) btn.removeAttribute('disabled');
         }""")
 
+        # Capturar URL antes del click para detectar navegación
         url_before = page.url
-        confirm_ok = False
-        confirm_body = ""
 
         # === Intento 1: Click Playwright en #btn-redeem ===
-        redeem_btn = page.locator("#btn-redeem").first
-        if await redeem_btn.count() > 0:
-            logger.info("Submit: click #btn-redeem (force)...")
+        redeem_btn = page.locator("#btn-redeem")
+
+        if await redeem_btn.count() > 0 and await redeem_btn.is_visible():
+            logger.info("Intento 1: Clic Playwright en #btn-redeem...")
             try:
                 async with page.expect_response(
                     lambda r: "/confirm" in r.url,
                     timeout=10_000
                 ) as confirm_info:
-                    await redeem_btn.click(force=True, timeout=3_000)
+                    await redeem_btn.click(timeout=5_000)
                 confirm_resp = await confirm_info.value
-                logger.info("/confirm: HTTP %s", confirm_resp.status)
+                logger.info("Respuesta /confirm: HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
                 try:
                     confirm_body = await confirm_resp.text()
-                except Exception:
-                    pass
+                    logger.info("Body /confirm (500 chars): %s", confirm_body[:500].replace("\n", " "))
+                except Exception as te:
+                    logger.warning("No se pudo leer body de /confirm: %s", te)
                 if confirm_resp.status < 400:
                     confirm_ok = True
             except Exception as e:
-                logger.warning("Intento 1 falló: %s", e)
+                logger.warning("Intento 1 falló (timeout /confirm): %s", e)
 
-        # === Intento 2: reCAPTCHA token fresco + JS click ===
+        # === Intento 2: Buscar sitekey + reCAPTCHA token + submit via JS ===
         if not confirm_ok and not confirm_body:
+            # Primero: diagnosticar reCAPTCHA y buscar sitekey
             recaptcha_diag = await page.evaluate("""() => {
-                const diag = {hasExecute: !!(window.grecaptcha && window.grecaptcha.execute), sitekey: null};
+                const diag = {
+                    hasGrecaptcha: !!window.grecaptcha,
+                    hasExecute: !!(window.grecaptcha && window.grecaptcha.execute),
+                    sitekey: null,
+                    method: null
+                };
+                // Método 1: data-sitekey en el DOM
                 const el = document.querySelector('[data-sitekey]');
-                if (el) { diag.sitekey = el.getAttribute('data-sitekey'); return diag; }
+                if (el) { diag.sitekey = el.getAttribute('data-sitekey'); diag.method = 'data-sitekey'; return diag; }
+
+                // Método 2: reCAPTCHA iframe src
                 const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
                 for (const f of iframes) {
                     const m = f.src.match(/[?&]k=([^&]+)/);
-                    if (m) { diag.sitekey = m[1]; return diag; }
+                    if (m) { diag.sitekey = m[1]; diag.method = 'iframe_src'; return diag; }
                 }
+
+                // Método 3: script tags con sitekey
                 const scripts = document.querySelectorAll('script[src*="recaptcha"]');
                 for (const s of scripts) {
                     const m = s.src.match(/render=([^&]+)/);
-                    if (m) { diag.sitekey = m[1]; return diag; }
+                    if (m) { diag.sitekey = m[1]; diag.method = 'script_render'; return diag; }
                 }
+
+                // Método 4: grecaptcha internal config
                 try {
                     const cfg = window.___grecaptcha_cfg;
                     if (cfg && cfg.clients) {
                         for (const cid in cfg.clients) {
-                            const json = JSON.stringify(cfg.clients[cid]);
+                            const c = cfg.clients[cid];
+                            if (c && c.Hm) { diag.sitekey = c.Hm; diag.method = 'grecaptcha_cfg_Hm'; return diag; }
+                            // Buscar recursivamente
+                            const json = JSON.stringify(c);
                             const m = json.match(/6L[a-zA-Z0-9_-]{38,}/);
-                            if (m) { diag.sitekey = m[0]; return diag; }
+                            if (m) { diag.sitekey = m[0]; diag.method = 'grecaptcha_cfg_regex'; return diag; }
                         }
                     }
                 } catch(e) {}
-                const m = document.documentElement.innerHTML.match(/6L[a-zA-Z0-9_-]{38,}/);
-                if (m) diag.sitekey = m[0];
+
+                // Método 5: buscar en todo el HTML
+                const html = document.documentElement.innerHTML;
+                const m = html.match(/6L[a-zA-Z0-9_-]{38,}/);
+                if (m) { diag.sitekey = m[0]; diag.method = 'html_regex'; }
+
                 return diag;
             }""")
-            sitekey = recaptcha_diag.get("sitekey")
+            logger.info("reCAPTCHA diagnóstico: %s", recaptcha_diag)
 
-            if sitekey and recaptcha_diag.get("hasExecute"):
-                logger.info("Intento 2: token reCAPTCHA + JS click...")
+            sitekey = recaptcha_diag.get('sitekey')
+
+            if sitekey and recaptcha_diag.get('hasExecute'):
+                logger.info("Intento 2: Token fresco con sitekey=%s...", sitekey[:20])
                 try:
                     async with page.expect_response(
-                        lambda r: "/confirm" in r.url, timeout=15_000
+                        lambda r: "/confirm" in r.url,
+                        timeout=15_000
                     ) as confirm_info:
-                        await page.evaluate("""(sk) => {
+                        js_result = await page.evaluate("""(sk) => {
                             return new Promise((resolve) => {
                                 window.grecaptcha.execute(sk, {action: 'confirm'}).then(token => {
+                                    // Inyectar token
                                     let inp = document.querySelector('#g-recaptcha-response') ||
                                               document.querySelector('textarea[name="g-recaptcha-response"]');
                                     if (!inp) {
@@ -517,66 +629,110 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                                         });
                                     }
                                     if (inp) { inp.value = token; inp.innerHTML = token; }
+
+                                    // Click el botón
                                     const btn = document.querySelector('#btn-redeem');
                                     if (btn) {
                                         btn.removeAttribute('disabled');
                                         btn.click();
-                                        resolve('ok');
+                                        resolve('clicked_with_token_' + token.substring(0,20));
                                     } else { resolve('no_btn'); }
-                                }).catch(err => resolve('err: ' + err.message));
+                                }).catch(err => resolve('recaptcha_error: ' + err.message));
                             });
                         }""", sitekey)
+                        logger.info("JS submit result: %s", js_result)
                     confirm_resp = await confirm_info.value
-                    logger.info("/confirm (JS): HTTP %s", confirm_resp.status)
+                    logger.info("Respuesta /confirm (JS): HTTP %s URL: %s", confirm_resp.status, confirm_resp.url)
                     try:
                         confirm_body = await confirm_resp.text()
-                    except Exception:
-                        pass
+                        logger.info("Body /confirm (JS) (500 chars): %s", confirm_body[:500].replace("\n", " "))
+                    except Exception as te:
+                        logger.warning("No se pudo leer body de /confirm (JS): %s", te)
                     if confirm_resp.status < 400:
                         confirm_ok = True
                 except Exception as e:
                     logger.warning("Intento 2 falló: %s", e)
             else:
-                logger.warning("Sin sitekey reCAPTCHA para intento 2")
+                logger.warning("No se encontró sitekey de reCAPTCHA, no se puede hacer Intento 2")
 
-        # === Intento 3: form.submit() directo ===
+        # === Intento 3: Fetch directo a /confirm con todos los datos ===
         if not confirm_ok and not confirm_body:
-            logger.info("Intento 3: form.submit()...")
+            logger.info("Intento 3: Fetch directo a /confirm...")
             try:
                 async with page.expect_response(
-                    lambda r: "/confirm" in r.url, timeout=15_000
+                    lambda r: "/confirm" in r.url,
+                    timeout=15_000
                 ) as confirm_info:
-                    await page.evaluate("""() => {
-                        const form = document.querySelector('form');
-                        if (form) form.submit();
+                    js_result = await page.evaluate("""() => {
+                        return new Promise(async (resolve) => {
+                            try {
+                                // Recolectar datos del formulario
+                                const formData = {};
+                                document.querySelectorAll('input, select, textarea').forEach(el => {
+                                    if (el.name || el.id) {
+                                        const key = el.name || el.id;
+                                        if (el.type === 'checkbox') { formData[key] = el.checked; }
+                                        else { formData[key] = el.value; }
+                                    }
+                                });
+
+                                // Buscar el form action o construir la URL
+                                const form = document.querySelector('form');
+                                const action = form ? (form.action || '/confirm') : '/confirm';
+
+                                // Submit el form directamente
+                                if (form) {
+                                    form.submit();
+                                    resolve('form_submitted');
+                                } else {
+                                    resolve('no_form_found: ' + JSON.stringify(Object.keys(formData)));
+                                }
+                            } catch(e) {
+                                resolve('error: ' + e.message);
+                            }
+                        });
                     }""")
+                    logger.info("Intento 3 result: %s", js_result)
                 confirm_resp = await confirm_info.value
+                logger.info("Respuesta /confirm (form.submit): HTTP %s", confirm_resp.status)
                 try:
                     confirm_body = await confirm_resp.text()
+                    logger.info("Body /confirm (form) (500 chars): %s", confirm_body[:500].replace("\n", " "))
                 except Exception:
                     pass
                 if confirm_resp.status < 400:
                     confirm_ok = True
             except Exception as e:
-                logger.warning("Intento 3 falló: %s", e)
+                logger.warning("Intento 3 (form.submit) falló: %s", e)
 
         if not confirm_ok and not confirm_body:
+            logger.warning("Ambos intentos de submit fallaron")
             return RedeemResponse(
                 success=False,
                 message="No se pudo enviar el formulario de canje",
                 player_name=player_name,
-                details="Los 3 intentos de submit fallaron",
+                details="Ambos intentos (Playwright click + JS submit con reCAPTCHA) fallaron",
             )
 
-        # ── 11. Verificar resultado final ─────────────────────────────
+        # Breve espera para que la página procese la respuesta
+        await asyncio.sleep(0.3)
+
+        # Capturar URL actual
+        url_after = page.url
+        logger.info("URL antes: %s → después: %s", url_before, url_after)
+        url_changed = url_after != url_before
+
+        # ── 10. Verificar resultado final ─────────────────────────────
         page_text = await page.inner_text("body")
         lower_text = page_text.lower()
+        logger.info("Resultado final (300 chars): %s", page_text[:300].replace("\n", " "))
+
+        # Combinar texto de página + body de /confirm para buscar éxito
         combined_text = (lower_text + " " + confirm_body.lower()).strip()
-        logger.info("Resultado (200c): %s", page_text[:200].replace("\n", " "))
 
         for kw in SUCCESS_KEYWORDS:
             if kw in combined_text:
-                logger.info("Canje EXITOSO keyword='%s' jugador=%s en %.1fs", kw, player_name, time.time() - start)
+                logger.info("¡Canje exitoso confirmado! keyword='%s' Jugador: %s", kw, player_name)
                 return RedeemResponse(
                     success=True,
                     message="PIN canjeado exitosamente",
@@ -584,8 +740,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     details=kw,
                 )
 
-        # Analizar body de /confirm (JSON o texto)
+        # Si /confirm respondió, analizar el body (puede ser JSON)
         if confirm_ok and confirm_body:
+            # Intentar parsear como JSON primero
             confirm_json = None
             try:
                 confirm_json = json.loads(confirm_body)
@@ -593,8 +750,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 pass
 
             if confirm_json and isinstance(confirm_json, dict):
+                # JSON con campo Success explícito
                 if confirm_json.get("Success") is True:
-                    logger.info("Canje EXITOSO (JSON Success=true) jugador=%s en %.1fs", player_name, time.time() - start)
+                    logger.info("Canje exitoso (/confirm JSON Success=true). Jugador: %s", player_name)
                     return RedeemResponse(
                         success=True,
                         message="PIN canjeado exitosamente",
@@ -602,7 +760,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                         details=f"confirm JSON: {confirm_body[:200]}",
                     )
                 else:
+                    # JSON con Success=false → FALLO claro
                     err_msg = confirm_json.get("Message", confirm_body[:200])
+                    logger.warning("Confirm JSON Success=false: %s", err_msg)
                     return RedeemResponse(
                         success=False,
                         message=f"Error del servidor: {err_msg}",
@@ -610,18 +770,24 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                         details=confirm_body[:300],
                     )
             else:
+                # Body no es JSON, buscar keywords de error
                 confirm_lower = confirm_body.lower()
-                if not any(e in confirm_lower for e in CONFIRM_ERROR_KEYWORDS):
-                    logger.info("Canje EXITOSO (HTTP 200 sin errores) jugador=%s en %.1fs", player_name, time.time() - start)
+                error_in_confirm = any(e in confirm_lower for e in CONFIRM_ERROR_KEYWORDS)
+                if not error_in_confirm:
+                    logger.info("Canje exitoso (/confirm HTTP 200, sin errores en body). Jugador: %s", player_name)
                     return RedeemResponse(
                         success=True,
                         message="PIN canjeado exitosamente",
                         player_name=player_name,
                         details=f"confirm HTTP 200, body: {confirm_body[:200]}",
                     )
+                else:
+                    logger.warning("Error en body de /confirm: %s", confirm_body[:300])
 
-        # Formulario sigue visible → NO se canjeó
-        if any(kw in lower_text for kw in STILL_ON_FORM_KEYWORDS):
+        # Indicadores de que el formulario sigue ahí (NO se canjeó)
+        form_still_visible = any(kw in lower_text for kw in STILL_ON_FORM_KEYWORDS)
+        if form_still_visible:
+            logger.warning("Página sigue en formulario - canje NO se completó")
             return RedeemResponse(
                 success=False,
                 message="Canje no completado: el formulario sigue visible",
@@ -629,9 +795,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 details=page_text[:400].strip(),
             )
 
-        # Sin confirmación clara → FALLO
+        # Si no hay confirmación clara → FALLO
         snippet = page_text[:500].strip()
-        logger.warning("Resultado incierto: %s", snippet[:200])
+        logger.warning("Resultado incierto, reportando como FALLO: %s", snippet[:200])
         return RedeemResponse(
             success=False,
             message="Resultado incierto – no se confirmó el canje",
