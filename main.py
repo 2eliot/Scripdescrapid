@@ -360,17 +360,23 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                "playerId": data.player_id, "country": country_name})
         logger.info("Fill masivo: %s", fill_result)
 
-        # Si país no se cargó aún, esperar opciones async y seleccionar trusted
+        # Si país no se cargó aún, esperar opciones en .card.back y seleccionar
         if not fill_result.get("country"):
-            country_sel = page.locator("#NationalityAlphaCode").first
-            for _ in range(15):
-                opt_count = await country_sel.evaluate("el => el.options.length")
+            # Usar .card.back selector para evitar el duplicado en .card.front
+            country_sel = page.locator(".card.back #NationalityAlphaCode")
+            for _ in range(20):
+                opt_count = await page.evaluate("""() => {
+                    const back = document.querySelector('.card.back') || document;
+                    const sel = back.querySelector('#NationalityAlphaCode');
+                    return sel ? sel.options.length : 0;
+                }""")
                 if opt_count > 1:
                     break
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.15)
             try:
                 target_value = await page.evaluate("""(cn) => {
-                    const el = document.querySelector('#NationalityAlphaCode');
+                    const back = document.querySelector('.card.back') || document;
+                    const el = back.querySelector('#NationalityAlphaCode');
                     if (!el) return null;
                     for (const opt of el.options) {
                         if (opt.text.toLowerCase().includes(cn)) return opt.value;
@@ -380,7 +386,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 }""", country_name)
                 if target_value:
                     await country_sel.select_option(value=target_value)
-                    logger.info("País seleccionado (fallback trusted): %s", target_value)
+                    logger.info("País seleccionado (fallback .card.back): %s", target_value)
+                else:
+                    logger.warning("No se encontró opción para país '%s'", country_name)
             except Exception as e:
                 logger.warning("Fallback país falló: %s", e)
 
