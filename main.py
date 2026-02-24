@@ -378,71 +378,78 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("Fallback país falló: %s", e)
 
-        # ── 8. Checkboxes via JS el.click() + verificación ──
-        # Los checkboxes son custom-styled (input oculto + label). JS click es más confiable.
-        cb_result = await page.evaluate("""() => {
-            const backs = document.querySelectorAll('.card.back input[type="checkbox"]');
-            const results = [];
-            backs.forEach((cb, i) => {
-                cb.checked = false; // Reset primero
-                cb.click();         // Trigger click nativo del DOM
-                results.push({id: cb.id, checked: cb.checked});
-            });
-            // Habilitar todos los botones
-            document.querySelectorAll('.card.back button, .card.back [type="submit"]').forEach(b => {
-                b.removeAttribute('disabled');
-            });
-            return results;
-        }""")
-        logger.info("Checkboxes via JS: %s", cb_result)
+        # ── 8. Marcar checkboxes con TRUSTED click de Playwright ─────
+        # IMPORTANTE: NO usar JS para marcar checkboxes. El framework de la
+        # página solo registra clicks reales del navegador.
+        logger.info("Marcando checkboxes de términos (trusted click)...")
 
-        # Si JS click no marcó alguno, intentar Playwright trusted click
-        all_checkboxes = page.locator('.card.back input[type="checkbox"]')
+        # Primero: forzar UNCHECK via JS para que Playwright pueda hacer click
+        await page.evaluate("""() => {
+            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.checked = false;
+            });
+        }""")
+
+        all_checkboxes = page.locator('input[type="checkbox"]')
         cb_count = await all_checkboxes.count()
+        logger.info("Checkboxes encontrados: %d", cb_count)
         for i in range(cb_count):
             cb = all_checkboxes.nth(i)
-            is_checked = await cb.is_checked()
-            if not is_checked:
-                logger.info("Checkbox %d no marcado por JS, intentando Playwright...", i)
-                try:
-                    await cb.check(force=True, timeout=2000)
-                except Exception:
-                    try:
-                        cb_id = await cb.get_attribute("id") or f"idx{i}"
-                        label = page.locator(f'.card.back label[for="{cb_id}"]')
-                        if await label.count() > 0:
-                            await label.click(force=True, timeout=2000)
-                    except Exception as e:
-                        logger.warning("Checkbox %d falló completamente: %s", i, e)
+            try:
+                is_vis = await cb.is_visible()
+                cb_id = await cb.get_attribute("id") or f"idx{i}"
+                if is_vis:
+                    await cb.click(timeout=3000)
+                    logger.info("Checkbox %d (%s) marcado via click", i, cb_id)
+                else:
+                    # Checkbox oculto: intentar click en su label
+                    label = page.locator(f'label[for="{cb_id}"]')
+                    if await label.count() > 0 and await label.is_visible():
+                        await label.click(timeout=3000)
+                        logger.info("Checkbox %d (%s) marcado via label", i, cb_id)
+                    else:
+                        # Último recurso: forzar click via JS
+                        await cb.evaluate("el => { el.click(); }")
+                        logger.info("Checkbox %d (%s) marcado via JS", i, cb_id)
+            except Exception as e:
+                logger.warning("Checkbox %d falló: %s", i, e)
 
-        # Verificar estado final
-        cb_final = await page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('.card.back input[type="checkbox"]'))
-                .map(cb => ({id: cb.id, checked: cb.checked}));
-        }""")
-        logger.info("Checkboxes estado final: %s", cb_final)
+        await asyncio.sleep(0.3)
 
-        # ── 9. Click Verificar ID + interceptar /validate/account ──
+        # ── 9. Clic en botón VERIFICAR ID ────────────────────────────
         player_name = None
-        verify_btn = page.locator(
-            '.card.back #btn-verify, .card.back #btn-verify-account'
-        ).first
 
+        # Forzar habilitación del botón verify
+        await page.evaluate("""() => {
+            const btns = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
+            btns.forEach(b => b.removeAttribute('disabled'));
+        }""")
+
+        logger.info("Buscando botón de verificar ID...")
+        verify_btn = page.locator(
+            '#btn-verify,'
+            'button:has-text("Verificar ID"),'
+            'button:has-text("Verify ID"),'
+            'button:has-text("Verificar Id"),'
+            '#btn-verify-account'
+        ).first
         if await verify_btn.count() > 0:
-            # Intento A: Playwright click (trusted)
-            logger.info("Click Verificar ID (Playwright)...")
-            verify_ok = False
+            logger.info("Haciendo clic en Verificar ID...")
+
+            # Interceptar la respuesta de validate/account
             try:
                 async with page.expect_response(
-                    lambda r: "validate/account" in r.url, timeout=10_000
+                    lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
                 ) as response_info:
-                    await verify_btn.click(force=True, timeout=3000)
+                    await verify_btn.click(timeout=5000)
+
                 resp = await response_info.value
                 resp_json = await resp.json()
-                logger.info("validate/account: %s", resp_json)
+                logger.info("Respuesta validate/account: %s", resp_json)
+
                 if resp_json.get("Success"):
                     player_name = resp_json.get("Username", "")
-                    verify_ok = True
+                    logger.info("Player name: %s", player_name)
                 else:
                     error_msg = resp_json.get("Message", "ID inválido")
                     logger.warning("Error de ID: %s", error_msg)
@@ -452,50 +459,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                         details=error_msg,
                     )
             except Exception as e:
-                logger.warning("Verify ID Playwright falló: %s", e)
+                logger.warning("No se pudo interceptar validate/account: %s", e)
 
-            # Intento B: Si Playwright no disparó AJAX, hacer fetch directo
-            if not verify_ok:
-                logger.info("Verify ID fallback: fetch directo a /validate/account...")
-                try:
-                    verify_result = await page.evaluate("""(playerId) => {
-                        return new Promise((resolve) => {
-                            // Buscar la URL base del formulario
-                            const form = document.querySelector('.card.back form') || document.querySelector('form');
-                            const baseUrl = form ? new URL(form.action, window.location.origin).origin : window.location.origin;
-                            
-                            // Obtener el token antiforgery si existe
-                            const tokenEl = document.querySelector('input[name="__RequestVerificationToken"]');
-                            const token = tokenEl ? tokenEl.value : '';
-                            
-                            // Buscar el GameAccountId del formulario
-                            const gameIdEl = document.querySelector('#GameAccountId');
-                            const gameId = gameIdEl ? gameIdEl.value : playerId;
-                            
-                            fetch(baseUrl + '/validate/account?gameAccountId=' + encodeURIComponent(gameId), {
-                                method: 'GET',
-                                headers: {'X-Requested-With': 'XMLHttpRequest'}
-                            })
-                            .then(r => r.json())
-                            .then(data => resolve(data))
-                            .catch(err => resolve({error: err.message}));
-                        });
-                    }""", data.player_id)
-                    logger.info("Verify ID fetch result: %s", verify_result)
-                    if isinstance(verify_result, dict):
-                        if verify_result.get("Success"):
-                            player_name = verify_result.get("Username", "")
-                        elif verify_result.get("error"):
-                            logger.warning("Fetch verify error: %s", verify_result["error"])
-                        else:
-                            error_msg = verify_result.get("Message", "ID inválido")
-                            return RedeemResponse(
-                                success=False,
-                                message="Error de ID del jugador",
-                                details=error_msg,
-                            )
-                except Exception as e:
-                    logger.warning("Verify ID fetch falló: %s", e)
+            await asyncio.sleep(0.3)
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
@@ -510,8 +476,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         confirm_ok = False
         confirm_body = ""
 
-        # === Intento 1: Click Playwright force=True en #btn-redeem (scoped) ===
-        redeem_btn = page.locator(".card.back #btn-redeem")
+        # === Intento 1: Click Playwright en #btn-redeem ===
+        redeem_btn = page.locator("#btn-redeem").first
         if await redeem_btn.count() > 0:
             logger.info("Submit: click #btn-redeem (force)...")
             try:
