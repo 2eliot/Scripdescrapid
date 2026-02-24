@@ -372,8 +372,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("Fallback país falló: %s", e)
 
-        # ── 8. Checkboxes con click(force=True) — trusted pero sin esperar animaciones ──
-        all_checkboxes = page.locator('input[type="checkbox"]')
+        # ── 8. Checkboxes con click(force=True) — scoped a .card.back ──
+        all_checkboxes = page.locator('.card.back input[type="checkbox"]')
         cb_count = await all_checkboxes.count()
         for i in range(cb_count):
             cb = all_checkboxes.nth(i)
@@ -382,7 +382,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception:
                 try:
                     cb_id = await cb.get_attribute("id") or f"idx{i}"
-                    label = page.locator(f'label[for="{cb_id}"]')
+                    label = page.locator(f'.card.back label[for="{cb_id}"]')
                     if await label.count() > 0:
                         await label.click(force=True, timeout=2000)
                     else:
@@ -393,13 +393,13 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # ── 9. Click Verificar ID (force) + interceptar /validate/account ──
         player_name = None
         verify_btn = page.locator(
-            '#btn-verify, #btn-verify-account'
+            '.card.back #btn-verify, .card.back #btn-verify-account'
         ).first
         if await verify_btn.count() > 0:
             logger.info("Click Verificar ID...")
             try:
                 async with page.expect_response(
-                    lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
+                    lambda r: "validate/account" in r.url, timeout=10_000
                 ) as response_info:
                     await verify_btn.click(force=True, timeout=3000)
                 resp = await response_info.value
@@ -431,8 +431,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         confirm_ok = False
         confirm_body = ""
 
-        # === Intento 1: Click Playwright force=True en #btn-redeem ===
-        redeem_btn = page.locator("#btn-redeem")
+        # === Intento 1: Click Playwright force=True en #btn-redeem (scoped) ===
+        redeem_btn = page.locator(".card.back #btn-redeem")
         if await redeem_btn.count() > 0:
             logger.info("Submit: click #btn-redeem (force)...")
             try:
