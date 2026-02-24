@@ -350,14 +350,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # Si país no se cargó aún, esperar opciones async y seleccionar trusted
         if not fill_result.get("country"):
-            country_sel = page.locator("#NationalityAlphaCode")
+            country_sel = page.locator("#NationalityAlphaCode").first
             for _ in range(15):
                 opt_count = await country_sel.evaluate("el => el.options.length")
                 if opt_count > 1:
                     break
                 await asyncio.sleep(0.1)
             try:
-                target_value = await country_sel.evaluate("""(cn) => {
+                target_value = await page.evaluate("""(cn) => {
                     const el = document.querySelector('#NationalityAlphaCode');
                     if (!el) return null;
                     for (const opt of el.options) {
