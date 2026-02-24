@@ -292,16 +292,17 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         logger.info("Formulario detectado en %.1fs", time.time() - start)
 
         # ── 7. INYECCIÓN MASIVA: campos + país + checkbox + habilitar botones ──
-        # Replicando enfoque de pin_redeemer.py: todo via JS (no Playwright clicks)
+        # IMPORTANTE: usar .card.back para todos los selectores (hay duplicados en .card.front)
         country_name = data.country.lower()
         fill_result = await page.evaluate("""(args) => {
             const {name, born, playerId, country} = args;
             const r = {fields: false, country: false, checkbox: false};
+            const back = document.querySelector('.card.back') || document;
 
-            // Campos de texto con dispatchEvent + keyup (para checkValidationForm de Hype)
-            const nameEl = document.querySelector('#Name');
-            const bornEl = document.querySelector('#BornAt');
-            const idEl   = document.querySelector('#GameAccountId');
+            // Campos de texto dentro de .card.back
+            const nameEl = back.querySelector('#Name');
+            const bornEl = back.querySelector('#BornAt');
+            const idEl   = back.querySelector('#GameAccountId');
             const ev = (el, v) => {
                 if (!el) return;
                 el.value = v;
@@ -312,8 +313,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             ev(nameEl, name); ev(bornEl, born); ev(idEl, playerId);
             r.fields = !!(nameEl && bornEl && idEl);
 
-            // Seleccionar país por texto del <option>
-            const sel = document.querySelector('#NationalityAlphaCode');
+            // Seleccionar país dentro de .card.back
+            const sel = back.querySelector('#NationalityAlphaCode');
             if (sel && sel.options.length > 1) {
                 for (const opt of sel.options) {
                     if (opt.text.toLowerCase().includes(country)) {
@@ -333,8 +334,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 }
             }
 
-            // Checkbox de privacidad via JS click (como pin_redeemer.py)
-            const privacyEl = document.getElementById('privacy');
+            // Checkbox de privacidad dentro de .card.back
+            const privacyEl = back.querySelector('#privacy');
             if (privacyEl && !privacyEl.checked) {
                 privacyEl.click();
                 r.checkbox = privacyEl.checked;
@@ -342,8 +343,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 r.checkbox = true;
             }
 
-            // Habilitar botones
-            document.querySelectorAll(
+            // Habilitar botones dentro de .card.back
+            back.querySelectorAll(
                 '#btn-verify, #btn-verify-account, .btn-verify, #btn-redeem'
             ).forEach(b => b.removeAttribute('disabled'));
 
@@ -386,10 +387,11 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # ── 8. Click Verificar ID via JS + poll DOM (como pin_redeemer.py) ──
         player_name = None
 
-        # Click #btn-verify via JS (no Playwright) — igual que pin_redeemer.py
-        logger.info("Click Verificar ID via JS...")
+        # Click #btn-verify via JS dentro de .card.back (hay duplicado en .card.front)
+        logger.info("Click Verificar ID via JS (.card.back)...")
         await page.evaluate("""() => {
-            const btn = document.getElementById('btn-verify');
+            const back = document.querySelector('.card.back') || document;
+            const btn = back.querySelector('#btn-verify') || back.querySelector('#btn-verify-account');
             if (btn) {
                 btn.removeAttribute('disabled');
                 btn.scrollIntoView({ behavior: 'instant', block: 'center' });
