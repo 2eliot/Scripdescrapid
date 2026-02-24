@@ -291,13 +291,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 )
         logger.info("Formulario detectado en %.1fs", time.time() - start)
 
-        # ── 7. INYECCIÓN MASIVA: campos + país + habilitar botones ────
+        # ── 7. INYECCIÓN MASIVA: campos + país + checkbox + habilitar botones ──
+        # Replicando enfoque de pin_redeemer.py: todo via JS (no Playwright clicks)
         country_name = data.country.lower()
         fill_result = await page.evaluate("""(args) => {
             const {name, born, playerId, country} = args;
-            const r = {fields: false, country: false};
+            const r = {fields: false, country: false, checkbox: false};
 
-            // Campos de texto con dispatchEvent
+            // Campos de texto con dispatchEvent + keyup (para checkValidationForm de Hype)
             const nameEl = document.querySelector('#Name');
             const bornEl = document.querySelector('#BornAt');
             const idEl   = document.querySelector('#GameAccountId');
@@ -306,6 +307,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 el.value = v;
                 el.dispatchEvent(new Event('input',  {bubbles:true}));
                 el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true}));
             };
             ev(nameEl, name); ev(bornEl, born); ev(idEl, playerId);
             r.fields = !!(nameEl && bornEl && idEl);
@@ -321,7 +323,6 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     }
                 }
                 if (!r.country) {
-                    // Fallback: primera opción no vacía
                     for (const opt of sel.options) {
                         if (opt.value) {
                             sel.value = opt.value;
@@ -332,17 +333,21 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 }
             }
 
-            // Resetear checkboxes para que Playwright pueda marcarlos
-            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                cb.checked = false;
-            });
+            // Checkbox de privacidad via JS click (como pin_redeemer.py)
+            const privacyEl = document.getElementById('privacy');
+            if (privacyEl && !privacyEl.checked) {
+                privacyEl.click();
+                r.checkbox = privacyEl.checked;
+            } else if (privacyEl) {
+                r.checkbox = true;
+            }
 
-            // Habilitar botones que el framework deja disabled
+            // Habilitar botones
             document.querySelectorAll(
                 '#btn-verify, #btn-verify-account, .btn-verify, #btn-redeem'
             ).forEach(b => b.removeAttribute('disabled'));
 
-            // Limpiar overlays/modales que bloqueen clicks
+            // Limpiar overlays
             document.querySelectorAll(
                 '[class*="overlay"],[class*="backdrop"],[class*="modal"]'
             ).forEach(el => {
@@ -378,92 +383,67 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("Fallback país falló: %s", e)
 
-        # ── 8. Marcar checkboxes con TRUSTED click de Playwright ─────
-        # IMPORTANTE: NO usar JS para marcar checkboxes. El framework de la
-        # página solo registra clicks reales del navegador.
-        logger.info("Marcando checkboxes de términos (trusted click)...")
-
-        # Primero: forzar UNCHECK via JS para que Playwright pueda hacer click
-        await page.evaluate("""() => {
-            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                cb.checked = false;
-            });
-        }""")
-
-        all_checkboxes = page.locator('input[type="checkbox"]')
-        cb_count = await all_checkboxes.count()
-        logger.info("Checkboxes encontrados: %d", cb_count)
-        for i in range(cb_count):
-            cb = all_checkboxes.nth(i)
-            try:
-                is_vis = await cb.is_visible()
-                cb_id = await cb.get_attribute("id") or f"idx{i}"
-                if is_vis:
-                    await cb.click(timeout=3000)
-                    logger.info("Checkbox %d (%s) marcado via click", i, cb_id)
-                else:
-                    # Checkbox oculto: intentar click en su label
-                    label = page.locator(f'label[for="{cb_id}"]')
-                    if await label.count() > 0 and await label.is_visible():
-                        await label.click(timeout=3000)
-                        logger.info("Checkbox %d (%s) marcado via label", i, cb_id)
-                    else:
-                        # Último recurso: forzar click via JS
-                        await cb.evaluate("el => { el.click(); }")
-                        logger.info("Checkbox %d (%s) marcado via JS", i, cb_id)
-            except Exception as e:
-                logger.warning("Checkbox %d falló: %s", i, e)
-
-        await asyncio.sleep(0.3)
-
-        # ── 9. Clic en botón VERIFICAR ID ────────────────────────────
+        # ── 8. Click Verificar ID via JS + poll DOM (como pin_redeemer.py) ──
         player_name = None
 
-        # Forzar habilitación del botón verify
+        # Click #btn-verify via JS (no Playwright) — igual que pin_redeemer.py
+        logger.info("Click Verificar ID via JS...")
         await page.evaluate("""() => {
-            const btns = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
-            btns.forEach(b => b.removeAttribute('disabled'));
+            const btn = document.getElementById('btn-verify');
+            if (btn) {
+                btn.removeAttribute('disabled');
+                btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+                btn.click();
+            }
         }""")
 
-        logger.info("Buscando botón de verificar ID...")
-        verify_btn = page.locator(
-            '#btn-verify,'
-            'button:has-text("Verificar ID"),'
-            'button:has-text("Verify ID"),'
-            'button:has-text("Verificar Id"),'
-            '#btn-verify-account'
-        ).first
-        if await verify_btn.count() > 0:
-            logger.info("Haciendo clic en Verificar ID...")
+        # Poll DOM esperando que #btn-redeem se habilite o nombre de jugador aparezca
+        # (exactamente como pin_redeemer.py paso 7.5)
+        redeem_ready = False
+        for attempt in range(20):  # Máximo 10 segundos
+            await asyncio.sleep(0.5)
 
-            # Interceptar la respuesta de validate/account
-            try:
-                async with page.expect_response(
-                    lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
-                ) as response_info:
-                    await verify_btn.click(timeout=5000)
+            check = await page.evaluate("""() => {
+                const redeemBtn = document.getElementById('btn-redeem');
+                const redeemData = document.querySelector('.redeem-data');
+                const playerName = document.getElementById('btn-player-game-data');
+                const errorEl = document.querySelector('.error-message, .alert-danger, .text-danger');
 
-                resp = await response_info.value
-                resp_json = await resp.json()
-                logger.info("Respuesta validate/account: %s", resp_json)
+                // Error visible
+                if (errorEl && errorEl.offsetParent !== null && errorEl.textContent.trim().length > 5) {
+                    return { status: 'error', message: errorEl.textContent.trim(), player_name: '' };
+                }
 
-                if resp_json.get("Success"):
-                    player_name = resp_json.get("Username", "")
-                    logger.info("Player name: %s", player_name)
-                else:
-                    error_msg = resp_json.get("Message", "ID inválido")
-                    logger.warning("Error de ID: %s", error_msg)
-                    return RedeemResponse(
-                        success=False,
-                        message="Error de ID del jugador",
-                        details=error_msg,
-                    )
-            except Exception as e:
-                logger.warning("No se pudo interceptar validate/account: %s", e)
+                // Botón Canjear visible + datos del jugador
+                if (redeemBtn && redeemData && redeemData.style.display !== 'none') {
+                    const name = playerName ? playerName.textContent.trim() : '';
+                    return { status: 'ready', message: 'Player: ' + name, player_name: name };
+                }
 
-            await asyncio.sleep(0.3)
-        else:
-            logger.warning("Botón Verificar ID no encontrado, continuando...")
+                // Verify sigue en loading
+                const verifyBtn = document.getElementById('btn-verify');
+                if (verifyBtn && verifyBtn.classList.contains('loading')) {
+                    return { status: 'loading', message: 'Verificando...', player_name: '' };
+                }
+
+                return { status: 'waiting', message: 'Esperando...', player_name: '' };
+            }""")
+
+            logger.info("Verify [%d]: %s - %s", attempt + 1, check['status'], check['message'])
+
+            if check['status'] == 'ready':
+                redeem_ready = True
+                player_name = check.get('player_name', '')
+                break
+            elif check['status'] == 'error':
+                return RedeemResponse(
+                    success=False,
+                    message="Error de ID del jugador",
+                    details=check['message'],
+                )
+
+        if not redeem_ready:
+            logger.warning("Timeout esperando verificación de ID")
 
         # ── 10. Submit canje final ────────────────────────────────────
         # Habilitar btn-redeem (puede haberse re-deshabilitado)
