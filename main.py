@@ -291,115 +291,96 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 )
         logger.info("Formulario detectado en %.1fs", time.time() - start)
 
-        # ── 7. INYECCIÓN MASIVA: campos + país + checkbox + habilitar botones ──
-        # IMPORTANTE: usar .card.back para todos los selectores (hay duplicados en .card.front)
-        country_name = data.country.lower()
-        fill_result = await page.evaluate("""(args) => {
-            const {name, born, playerId, country} = args;
-            const r = {fields: false, country: false, checkbox: false};
-            const back = document.querySelector('.card.back') || document;
+        # ── 7. INYECCIÓN MASIVA: exactamente como pin_redeemer.py ─────
+        # Usa document.getElementById (NO .card.back), nativeInputValueSetter,
+        # scrollIntoView, focus, blur, keyup — replicando lo que funciona en producción
+        country_codes = {
+            'chile': 'CL', 'argentina': 'AR', 'colombia': 'CO', 'mexico': 'MX',
+            'méxico': 'MX', 'peru': 'PE', 'perú': 'PE', 'venezuela': 'VE',
+            'ecuador': 'EC', 'bolivia': 'BO', 'uruguay': 'UY', 'paraguay': 'PY',
+            'brasil': 'BR', 'brazil': 'BR', 'panama': 'PA', 'panamá': 'PA',
+            'costa rica': 'CR', 'guatemala': 'GT', 'honduras': 'HN',
+            'el salvador': 'SV', 'nicaragua': 'NI', 'cuba': 'CU',
+            'republica dominicana': 'DO', 'puerto rico': 'PR',
+        }
+        nac_code = country_codes.get(data.country.lower(), data.country)
 
-            // Campos de texto dentro de .card.back
-            const nameEl = back.querySelector('#Name');
-            const bornEl = back.querySelector('#BornAt');
-            const idEl   = back.querySelector('#GameAccountId');
-            const ev = (el, v) => {
-                if (!el) return;
-                el.value = v;
-                el.dispatchEvent(new Event('input',  {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true}));
-            };
-            ev(nameEl, name); ev(bornEl, born); ev(idEl, playerId);
-            r.fields = !!(nameEl && bornEl && idEl);
+        fill_result = await page.evaluate("""(data) => {
+            const results = [];
 
-            // Seleccionar país dentro de .card.back
-            const sel = back.querySelector('#NationalityAlphaCode');
-            if (sel && sel.options.length > 1) {
-                for (const opt of sel.options) {
-                    if (opt.text.toLowerCase().includes(country)) {
-                        sel.value = opt.value;
-                        sel.dispatchEvent(new Event('change', {bubbles:true}));
-                        r.country = true; break;
-                    }
-                }
-                if (!r.country) {
-                    for (const opt of sel.options) {
-                        if (opt.value) {
-                            sel.value = opt.value;
-                            sel.dispatchEvent(new Event('change', {bubbles:true}));
-                            r.country = true; break;
-                        }
-                    }
-                }
+            function setVal(el, val) {
+                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                el.focus();
+                // nativeInputValueSetter para bypass de frameworks reactivos
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                const formItem = el.closest('.form-item');
+                if (formItem) formItem.classList.add('filled');
             }
 
-            // Checkbox de privacidad dentro de .card.back
-            const privacyEl = back.querySelector('#privacy');
+            // 1. Nombre (#Name)
+            const nameEl = document.getElementById('Name');
+            if (nameEl) { setVal(nameEl, data.name); results.push('Name: OK'); }
+            else results.push('Name: NOT_FOUND');
+
+            // 2. Fecha (#BornAt)
+            const bornEl = document.getElementById('BornAt');
+            if (bornEl) { setVal(bornEl, data.born); results.push('Born: OK'); }
+            else results.push('Born: NOT_FOUND');
+
+            // 3. País (#NationalityAlphaCode) - código ISO directo
+            const nacSel = document.getElementById('NationalityAlphaCode');
+            if (nacSel) {
+                nacSel.scrollIntoView({ behavior: 'instant', block: 'center' });
+                nacSel.value = data.nac_code;
+                nacSel.dispatchEvent(new Event('change', { bubbles: true }));
+                results.push('Country: OK -> ' + data.nac_code);
+            } else results.push('Country: NOT_FOUND');
+
+            // 4. Player ID (#GameAccountId)
+            const gameEl = document.getElementById('GameAccountId');
+            if (gameEl) {
+                setVal(gameEl, data.playerId);
+                gameEl.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                results.push('PlayerID: OK -> ' + data.playerId);
+            } else results.push('PlayerID: NOT_FOUND');
+
+            // 5. Checkbox (#privacy)
+            const privacyEl = document.getElementById('privacy');
             if (privacyEl && !privacyEl.checked) {
                 privacyEl.click();
-                r.checkbox = privacyEl.checked;
+                results.push('Checkbox: clicked -> ' + privacyEl.checked);
             } else if (privacyEl) {
-                r.checkbox = true;
+                results.push('Checkbox: already checked');
             }
 
-            // Habilitar botones dentro de .card.back
-            back.querySelectorAll(
-                '#btn-verify, #btn-verify-account, .btn-verify, #btn-redeem'
-            ).forEach(b => b.removeAttribute('disabled'));
+            // 6. Habilitar botón Verificar
+            const verifyBtn = document.getElementById('btn-verify');
+            if (verifyBtn) {
+                verifyBtn.removeAttribute('disabled');
+                results.push('Verify btn: enabled');
+            }
 
-            // Limpiar overlays
-            document.querySelectorAll(
-                '[class*="overlay"],[class*="backdrop"],[class*="modal"]'
-            ).forEach(el => {
-                if (el.id !== 'btn-redeem' && !el.closest('.card')) el.remove();
-            });
-
-            return r;
+            return results;
         }""", {"name": data.full_name, "born": data.birth_date,
-               "playerId": data.player_id, "country": country_name})
-        logger.info("Fill masivo: %s", fill_result)
+               "playerId": data.player_id, "nac_code": nac_code})
+        logger.info("Fill (pin_redeemer style): %s", fill_result)
 
-        # Si país no se cargó aún, esperar opciones en .card.back y seleccionar
-        if not fill_result.get("country"):
-            # Usar .card.back selector para evitar el duplicado en .card.front
-            country_sel = page.locator(".card.back #NationalityAlphaCode")
-            for _ in range(20):
-                opt_count = await page.evaluate("""() => {
-                    const back = document.querySelector('.card.back') || document;
-                    const sel = back.querySelector('#NationalityAlphaCode');
-                    return sel ? sel.options.length : 0;
-                }""")
-                if opt_count > 1:
-                    break
-                await asyncio.sleep(0.15)
-            try:
-                target_value = await page.evaluate("""(cn) => {
-                    const back = document.querySelector('.card.back') || document;
-                    const el = back.querySelector('#NationalityAlphaCode');
-                    if (!el) return null;
-                    for (const opt of el.options) {
-                        if (opt.text.toLowerCase().includes(cn)) return opt.value;
-                    }
-                    for (const opt of el.options) { if (opt.value) return opt.value; }
-                    return null;
-                }""", country_name)
-                if target_value:
-                    await country_sel.select_option(value=target_value)
-                    logger.info("País seleccionado (fallback .card.back): %s", target_value)
-                else:
-                    logger.warning("No se encontró opción para país '%s'", country_name)
-            except Exception as e:
-                logger.warning("Fallback país falló: %s", e)
+        await asyncio.sleep(0.08)
 
         # ── 8. Click Verificar ID via JS + poll DOM (como pin_redeemer.py) ──
         player_name = None
 
-        # Click #btn-verify via JS dentro de .card.back (hay duplicado en .card.front)
-        logger.info("Click Verificar ID via JS (.card.back)...")
+        # Click #btn-verify via JS (document.getElementById, como pin_redeemer.py)
+        logger.info("Click Verificar ID via JS...")
         await page.evaluate("""() => {
-            const back = document.querySelector('.card.back') || document;
-            const btn = back.querySelector('#btn-verify') || back.querySelector('#btn-verify-account');
+            const btn = document.getElementById('btn-verify');
             if (btn) {
                 btn.removeAttribute('disabled');
                 btn.scrollIntoView({ behavior: 'instant', block: 'center' });
