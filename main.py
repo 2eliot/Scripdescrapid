@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -20,7 +21,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _playwright = None
 _browser: Browser | None = None
-_redeem_lock = asyncio.Lock()  # Serializar canjes (1 a la vez)
+
+# Concurrencia: N contextos simultáneos en 1 solo browser
+# Cada contexto ≈ 10-20 MB vs 150-300 MB por browser nuevo
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_REDEEMS", "3"))
+_redeem_semaphore: asyncio.Semaphore | None = None
+_active_contexts = 0  # Contador de contextos activos
+_total_redeems = 0    # Total de canjes procesados
 
 REDEEM_URL = "https://redeem.hype.games/"
 TIMEOUT_MS = 30_000
@@ -121,13 +128,13 @@ async def _ensure_browser():
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _playwright, _browser, _redeem_lock
-    _redeem_lock = asyncio.Lock()
+    global _playwright, _browser, _redeem_semaphore
+    _redeem_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(
         headless=True, args=BROWSER_ARGS
     )
-    logger.info("Navegador Chromium pre-lanzado y listo ✓")
+    logger.info("Navegador Chromium pre-lanzado y listo ✓ (max %d contextos concurrentes)", MAX_CONCURRENT)
     yield
     try:
         if _browser:
@@ -809,9 +816,16 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 # ---------------------------------------------------------------------------
 @app.post("/redeem", response_model=RedeemResponse)
 async def redeem_pin(data: RedeemRequest):
-    logger.info("Petición de canje recibida para player_id=%s", data.player_id)
-    async with _redeem_lock:
-        result = await automate_redeem(data)
+    global _active_contexts, _total_redeems
+    logger.info("Petición de canje recibida para player_id=%s (activos: %d/%d)",
+                data.player_id, _active_contexts, MAX_CONCURRENT)
+    async with _redeem_semaphore:
+        _active_contexts += 1
+        _total_redeems += 1
+        try:
+            result = await automate_redeem(data)
+        finally:
+            _active_contexts -= 1
     return result
 
 
@@ -826,7 +840,6 @@ async def health():
 @app.get("/metrics")
 async def metrics():
     """Endpoint para monitorear uso de recursos en el VPS."""
-    import os
     import psutil
     proc = psutil.Process(os.getpid())
     mem = proc.memory_info()
@@ -836,6 +849,9 @@ async def metrics():
         "cpu_percent": proc.cpu_percent(interval=0.1),
         "threads": proc.num_threads(),
         "browser_connected": _browser is not None and _browser.is_connected(),
+        "active_contexts": _active_contexts,
+        "max_concurrent": MAX_CONCURRENT,
+        "total_redeems": _total_redeems,
     }
 
 
