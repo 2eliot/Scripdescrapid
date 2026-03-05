@@ -29,6 +29,11 @@ _redeem_semaphore: asyncio.Semaphore | None = None
 _active_contexts = 0  # Contador de contextos activos
 _total_redeems = 0    # Total de canjes procesados
 
+# Cache de idempotencia: evita procesar el mismo request_id dos veces
+# { request_id: {success, message, player_name, details} }
+_IDEMPOTENCY_CACHE_MAX = 500
+_idempotency_cache: dict = {}
+
 REDEEM_URL = "https://redeem.hype.games/"
 TIMEOUT_MS = 30_000
 
@@ -161,6 +166,7 @@ class RedeemRequest(BaseModel):
     birth_date: str
     player_id: str
     country: str
+    request_id: str | None = None
 
 
 class RedeemResponse(BaseModel):
@@ -816,9 +822,17 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 # ---------------------------------------------------------------------------
 @app.post("/redeem", response_model=RedeemResponse)
 async def redeem_pin(data: RedeemRequest):
-    global _active_contexts, _total_redeems
+    global _active_contexts, _total_redeems, _idempotency_cache
     logger.info("Petición de canje recibida para player_id=%s (activos: %d/%d)",
                 data.player_id, _active_contexts, MAX_CONCURRENT)
+
+    # Idempotencia: si ya procesamos este request_id, devolver resultado cacheado
+    if data.request_id and data.request_id in _idempotency_cache:
+        cached = _idempotency_cache[data.request_id]
+        logger.info("[Idempotencia] request_id=%s ya procesado, devolviendo resultado cacheado: success=%s",
+                    data.request_id, cached.success)
+        return cached
+
     async with _redeem_semaphore:
         _active_contexts += 1
         _total_redeems += 1
@@ -826,6 +840,16 @@ async def redeem_pin(data: RedeemRequest):
             result = await automate_redeem(data)
         finally:
             _active_contexts -= 1
+
+    # Guardar en cache si se proporcionó request_id
+    if data.request_id:
+        if len(_idempotency_cache) >= _IDEMPOTENCY_CACHE_MAX:
+            oldest_key = next(iter(_idempotency_cache))
+            del _idempotency_cache[oldest_key]
+        _idempotency_cache[data.request_id] = result
+        logger.info("[Idempotencia] request_id=%s guardado en cache (cache size: %d)",
+                    data.request_id, len(_idempotency_cache))
+
     return result
 
 
