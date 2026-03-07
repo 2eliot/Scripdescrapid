@@ -356,29 +356,30 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # ── 5. Seleccionar país con Playwright (trusted) ──────────
         # Las opciones se cargan async desde /countries — esperar a que existan
-        country_sel = page.locator("#NationalityAlphaCode")
+        # Usar .first para evitar strict mode violation (la página tiene 2 selects con mismo ID)
+        country_sel = page.locator("#NationalityAlphaCode").first
         logger.info("Esperando opciones del select de país...")
-        try:
-            await page.wait_for_function(
-                "() => (document.querySelector('#NationalityAlphaCode')?.options.length ?? 0) > 1",
-                timeout=8_000
-            )
-        except Exception:
-            logger.warning("Timeout esperando opciones de país")
-        opt_count = await country_sel.evaluate("el => el.options.length")
+        # Esperar con reintentos manuales — el endpoint /countries puede tardar tras el flip
+        opt_count = 0
+        for _ in range(40):  # hasta 4s en pasos de 100ms
+            try:
+                opt_count = await country_sel.evaluate("el => el.options.length")
+            except Exception:
+                opt_count = 0
+            if opt_count > 1:
+                break
+            await asyncio.sleep(0.1)
         logger.info("Opciones de país cargadas: %d", opt_count)
 
-        # Seleccionar país via Playwright select_option (trusted, dispara events nativos)
+        # Seleccionar país via JS directo sobre el primer select
         country_selected = False
         country_name = data.country.lower()
         try:
-            # Intentar por label parcial — obtener opciones y buscar match
             options_info = await country_sel.evaluate("""(el) => {
                 return Array.from(el.options).map(o => ({value: o.value, text: o.text})).slice(0, 5);
             }""")
             logger.info("Primeras 5 opciones: %s", options_info)
 
-            # Buscar el value de la opción que contenga el nombre del país
             target_value = await country_sel.evaluate("""(el, cn) => {
                 for (const opt of el.options) {
                     if (opt.text.toLowerCase().includes(cn)) return opt.value;
@@ -396,14 +397,12 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             logger.warning("Error seleccionando país via Playwright: %s", e)
 
         if not country_selected:
-            # Fallback: seleccionar Chile (CountryId=5 en los hidden fields)
             logger.info("Fallback: seleccionando Chile...")
             try:
                 target_value = await country_sel.evaluate("""(el) => {
                     for (const opt of el.options) {
                         if (opt.text.toLowerCase().includes('chile')) return opt.value;
                     }
-                    // Si no hay Chile, seleccionar la primera opción no vacía
                     for (const opt of el.options) {
                         if (opt.value) return opt.value;
                     }
@@ -438,11 +437,20 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         if await verify_btn.count() > 0:
             logger.info("Haciendo clic en Verificar ID (interceptando respuesta AJAX)...")
 
+            # Eliminar overlays que bloquean el click (mismo patrón que antes del btn-redeem)
+            await page.evaluate("""() => {
+                document.querySelectorAll(
+                    '[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"], ' +
+                    '[class*="Cookie"], [class*="Consent"], .cc-window, .cc-banner, #onetrust-banner-sdk'
+                ).forEach(el => el.remove());
+            }""")
+
             # Interceptar la respuesta de validate/account para obtener Username
             async with page.expect_response(
                 lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
             ) as response_info:
-                await verify_btn.click(timeout=5000)
+                # force=True para ignorar elementos que intercepten pointer events
+                await verify_btn.click(timeout=5000, force=True)
 
             try:
                 resp = await response_info.value
