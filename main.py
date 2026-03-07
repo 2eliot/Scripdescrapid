@@ -243,16 +243,15 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         except Exception as e:
             logger.warning("Cookie popup dismiss falló: %s", e)
 
-        # Esperar a que reCAPTCHA esté disponible (event-driven, sin polling)
+        # Esperar a que reCAPTCHA esté disponible
         recaptcha_ready = False
-        try:
-            await page.wait_for_function(
-                "() => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function'",
-                timeout=8_000
+        for _ in range(20):
+            recaptcha_ready = await page.evaluate(
+                "() => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function'"
             )
-            recaptcha_ready = True
-        except Exception:
-            recaptcha_ready = False
+            if recaptcha_ready:
+                break
+            await asyncio.sleep(0.15)
         logger.info("reCAPTCHA disponible: %s", recaptcha_ready)
 
         # ── 2. Ingresar el PIN ────────────────────────────────────────
@@ -261,17 +260,15 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         await pin_input.wait_for(state="visible", timeout=TIMEOUT_MS)
         await pin_input.fill(data.pin_key)
 
-        # Esperar a que el botón se habilite (event-driven)
+        # Esperar a que el botón se habilite
         logger.info("Esperando que botón Verificar se habilite...")
         btn_validate = page.locator("#btn-validate")
         await btn_validate.wait_for(state="visible", timeout=TIMEOUT_MS)
-        try:
-            await page.wait_for_function(
-                "() => !document.querySelector('#btn-validate')?.disabled",
-                timeout=8_000
-            )
-        except Exception:
-            logger.warning("Timeout esperando btn-validate habilitado, continuando...")
+        for _ in range(30):
+            disabled = await btn_validate.get_attribute("disabled")
+            if disabled is None:
+                break
+            await asyncio.sleep(0.15)
 
         # Clic en Verificar e interceptar la respuesta AJAX de /validate
         logger.info("Haciendo clic en Verificar (interceptando /validate)...")
@@ -358,14 +355,11 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Las opciones se cargan async desde /countries — esperar a que existan
         country_sel = page.locator("#NationalityAlphaCode")
         logger.info("Esperando opciones del select de país...")
-        try:
-            await page.wait_for_function(
-                "() => (document.querySelector('#NationalityAlphaCode')?.options.length ?? 0) > 1",
-                timeout=8_000
-            )
-        except Exception:
-            logger.warning("Timeout esperando opciones de país")
-        opt_count = await country_sel.evaluate("el => el.options.length")
+        for attempt in range(20):
+            opt_count = await country_sel.evaluate("el => el.options.length")
+            if opt_count > 1:  # >1 porque la primera es el placeholder
+                break
+            await asyncio.sleep(0.1)
         logger.info("Opciones de país cargadas: %d", opt_count)
 
         # Seleccionar país via Playwright select_option (trusted, dispara events nativos)
@@ -463,6 +457,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("No se pudo parsear respuesta validate/account: %s", e)
 
+            await asyncio.sleep(0.1)
         else:
             logger.warning("Botón Verificar ID no encontrado, continuando...")
 
@@ -503,6 +498,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             except Exception as e:
                 logger.warning("Checkbox %d (%s) falló: %s", i, cb_id, e)
 
+        await asyncio.sleep(0.1)
+
         # ── 9. Clic en botón final de canje ──────────────────────────
 
         logger.info("Habilitando y buscando botón de canje final...")
@@ -539,7 +536,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             try:
                 async with page.expect_response(
                     lambda r: "/confirm" in r.url,
-                    timeout=6_000
+                    timeout=10_000
                 ) as confirm_info:
                     await redeem_btn.click(timeout=5_000)
                 confirm_resp = await confirm_info.value
@@ -711,6 +708,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 player_name=player_name,
                 details="Ambos intentos (Playwright click + JS submit con reCAPTCHA) fallaron",
             )
+
+        # Breve espera para que la página procese la respuesta
+        await asyncio.sleep(0.1)
 
         # Capturar URL actual
         url_after = page.url
