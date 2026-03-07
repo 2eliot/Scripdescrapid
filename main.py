@@ -346,15 +346,15 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # ── 5. Seleccionar país con Playwright (trusted) ──────────
         # Las opciones se cargan async desde /countries — esperar a que existan
-        country_sel = page.locator(".card.back #NationalityAlphaCode")
+        country_sel = page.locator("#NationalityAlphaCode")
         logger.info("Esperando opciones del select de país...")
         try:
             await page.wait_for_function(
-                "() => document.querySelector('.card.back #NationalityAlphaCode')?.options.length > 1",
+                "() => document.querySelector('#NationalityAlphaCode')?.options.length > 1",
                 timeout=5_000
             )
         except Exception:
-            logger.warning("Timeout esperando opciones de país")
+            pass
         opt_count = await country_sel.evaluate("el => el.options.length")
         logger.info("Opciones de país cargadas: %d", opt_count)
 
@@ -410,13 +410,11 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Interceptamos esa respuesta para obtener el player_name directamente
         player_name = None
 
-        # Forzar habilitación del botón verify y eliminar overlays que bloquean clicks
+        # Forzar habilitación del botón verify (el JS de la página lo deja disabled
+        # si los eventos de validación no se dispararon correctamente con el fill via JS)
         await page.evaluate("""() => {
             const btns = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
             btns.forEach(b => b.removeAttribute('disabled'));
-            // Quitar pointer-events de <main> si intercepta clicks
-            const main = document.querySelector('main');
-            if (main) main.style.pointerEvents = 'none';
         }""")
 
         logger.info("Buscando botón de verificar ID...")
@@ -434,7 +432,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
             async with page.expect_response(
                 lambda r: "validate/account" in r.url, timeout=TIMEOUT_MS
             ) as response_info:
-                await verify_btn.click(timeout=5000, force=True)
+                await verify_btn.click(timeout=5000)
 
             try:
                 resp = await response_info.value
