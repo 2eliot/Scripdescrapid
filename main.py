@@ -327,22 +327,25 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                 )
 
         logger.info("Formulario detectado en .card.back")
+        back_card = page.locator(".card.back").first
 
         # ── 4. Llenar campos de texto via JS (instantáneo) ──────────
         logger.info("Llenando campos de texto via JS...")
         fill_ok = await page.evaluate("""(args) => {
             const {name, born, playerId} = args;
+            const back = document.querySelector('.card.back');
+            if (!back) return false;
 
             // Nombre
-            const nameEl = document.querySelector('#Name');
+            const nameEl = back.querySelector('#Name');
             if (nameEl) { nameEl.value = name; nameEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
             // Fecha de nacimiento
-            const bornEl = document.querySelector('#BornAt');
+            const bornEl = back.querySelector('#BornAt');
             if (bornEl) { bornEl.value = born; bornEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
             // Player ID
-            const idEl = document.querySelector('#GameAccountId');
+            const idEl = back.querySelector('#GameAccountId');
             if (idEl) { idEl.value = playerId; idEl.dispatchEvent(new Event('input', {bubbles:true})); }
 
             return !!(nameEl && bornEl && idEl);
@@ -353,7 +356,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # ── 5. Seleccionar país con Playwright (trusted) ──────────
         # Las opciones se cargan async desde /countries — esperar a que existan
-        country_sel = page.locator("#NationalityAlphaCode")
+        country_sel = back_card.locator("#NationalityAlphaCode").first
         logger.info("Esperando opciones del select de país...")
         for attempt in range(20):
             opt_count = await country_sel.evaluate("el => el.options.length")
@@ -417,12 +420,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Forzar habilitación del botón verify (el JS de la página lo deja disabled
         # si los eventos de validación no se dispararon correctamente con el fill via JS)
         await page.evaluate("""() => {
-            const btns = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
+            const back = document.querySelector('.card.back');
+            if (!back) return;
+            const btns = back.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
             btns.forEach(b => b.removeAttribute('disabled'));
         }""")
 
         logger.info("Buscando botón de verificar ID...")
-        verify_btn = page.locator(
+        verify_btn = back_card.locator(
             '#btn-verify,'
             'button:has-text("Verificar ID"),'
             'button:has-text("Verify ID"),'
@@ -469,12 +474,14 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         # Primero: forzar UNCHECK via JS para que Playwright pueda hacer click
         # (el paso 4 de form fill ya no toca checkboxes, pero por seguridad)
         await page.evaluate("""() => {
-            document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            const back = document.querySelector('.card.back');
+            if (!back) return;
+            back.querySelectorAll('input[type="checkbox"]').forEach(cb => {
                 cb.checked = false;
             });
         }""")
 
-        all_checkboxes = page.locator('input[type="checkbox"]')
+        all_checkboxes = back_card.locator('input[type="checkbox"]')
         cb_count = await all_checkboxes.count()
         logger.info("Checkboxes encontrados: %d", cb_count)
         for i in range(cb_count):
@@ -487,7 +494,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                     logger.info("Checkbox %d (%s) marcado via Playwright click", i, cb_id)
                 else:
                     # Checkbox oculto: intentar click en su label
-                    label = page.locator(f'label[for="{cb_id}"]')
+                    label = back_card.locator(f'label[for="{cb_id}"]')
                     if await label.count() > 0 and await label.is_visible():
                         await label.click(timeout=3000)
                         logger.info("Checkbox %d (%s) marcado via label click", i, cb_id)
@@ -521,7 +528,9 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
 
         # Habilitar btn-redeem via JS
         await page.evaluate("""() => {
-            const btn = document.querySelector('#btn-redeem');
+            const back = document.querySelector('.card.back');
+            if (!back) return;
+            const btn = back.querySelector('#btn-redeem');
             if (btn) btn.removeAttribute('disabled');
         }""")
 
@@ -529,7 +538,7 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
         url_before = page.url
 
         # === Intento 1: Click Playwright en #btn-redeem ===
-        redeem_btn = page.locator("#btn-redeem")
+        redeem_btn = back_card.locator("#btn-redeem").first
 
         if await redeem_btn.count() > 0 and await redeem_btn.is_visible():
             logger.info("Intento 1: Clic Playwright en #btn-redeem...")
@@ -626,7 +635,8 @@ async def automate_redeem(data: RedeemRequest) -> RedeemResponse:
                                     if (inp) { inp.value = token; inp.innerHTML = token; }
 
                                     // Click el botón
-                                    const btn = document.querySelector('#btn-redeem');
+                                    const back = document.querySelector('.card.back');
+                                    const btn = back ? back.querySelector('#btn-redeem') : null;
                                     if (btn) {
                                         btn.removeAttribute('disabled');
                                         btn.click();
