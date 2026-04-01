@@ -3,7 +3,7 @@ const { chromium } = require('playwright');
 
 const REDEEM_URL = 'https://redeem.hype.games/';
 const TIMEOUT_MS = 30_000;
-const MAX_CONCURRENT = Number.parseInt(process.env.MAX_CONCURRENT_REDEEMS || '3', 10);
+const MAX_CONCURRENT = Number.parseInt(process.env.MAX_CONCURRENT_REDEEMS || '8', 10);
 const IDEMPOTENCY_CACHE_MAX = 500;
 
 const PIN_ERROR_KEYWORDS = [
