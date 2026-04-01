@@ -191,7 +191,7 @@ async function createWarmedPage() {
         const resourceType = request.resourceType();
         const url = request.url();
 
-        if (['image', 'font', 'media'].includes(resourceType) || BLOCKED_DOMAINS.some((domain) => url.includes(domain))) {
+        if (['image', 'font', 'media', 'stylesheet'].includes(resourceType) || BLOCKED_DOMAINS.some((domain) => url.includes(domain))) {
             await route.abort();
             return;
         }
@@ -237,13 +237,14 @@ async function createWarmedPage() {
     return { context, page, ready: true };
 }
 
-// --- Fill the pool up to MAX_CONCURRENT ---
+// --- Fill the pool up to MAX_CONCURRENT + 1 (buffer) ---
 async function fillPool() {
     if (poolFilling) return;
     poolFilling = true;
+    const poolTarget = MAX_CONCURRENT + 1;
 
     try {
-        while (pagePool.length < MAX_CONCURRENT) {
+        while (pagePool.length < poolTarget) {
             try {
                 const entry = await createWarmedPage();
                 pagePool.push(entry);
@@ -300,7 +301,7 @@ function recyclePage(entry) {
                 await sleep(150);
             }
 
-            if (pagePool.length < MAX_CONCURRENT) {
+            if (pagePool.length < MAX_CONCURRENT + 1) {
                 pagePool.push(entry);
                 fastify.log.info({ poolSize: pagePool.length }, 'Página reciclada al pool');
             } else {
