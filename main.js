@@ -299,27 +299,31 @@ async function automateRedeem(data) {
         }
         fastify.log.info({ recaptchaReady }, 'Estado de reCAPTCHA');
 
-        const pinInput = page.locator('#pininput');
-        await pinInput.waitFor({ state: 'visible', timeout: TIMEOUT_MS });
-        await pinInput.fill(data.pin_key);
+        // --- PIN input via JS ---
+        await page.waitForSelector('#pininput', { state: 'visible', timeout: TIMEOUT_MS });
+        await page.evaluate((pin) => {
+            const el = document.querySelector('#pininput');
+            el.value = pin;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, data.pin_key);
 
-        const btnValidate = page.locator('#btn-validate');
-        await btnValidate.waitFor({ state: 'visible', timeout: TIMEOUT_MS });
+        // --- Wait for validate button to be enabled ---
+        await page.waitForFunction(
+            () => {
+                const btn = document.querySelector('#btn-validate');
+                return btn && !btn.disabled;
+            },
+            { timeout: TIMEOUT_MS, polling: 100 },
+        );
 
-        for (let attempt = 0; attempt < 30; attempt += 1) {
-            const disabled = await btnValidate.getAttribute('disabled');
-            if (disabled === null) {
-                break;
-            }
-            await sleep(150);
-        }
-
+        // --- Click validate via JS ---
         try {
             const validateResponsePromise = page.waitForResponse(
                 (response) => response.url().includes('/validate') && !response.url().includes('account'),
                 { timeout: TIMEOUT_MS },
             );
-            await btnValidate.click();
+            await page.evaluate(() => document.querySelector('#btn-validate').click());
             const validateResponse = await validateResponsePromise;
             fastify.log.info({ status: validateResponse.status() }, 'Respuesta /validate');
 
@@ -386,85 +390,85 @@ async function automateRedeem(data) {
             }
         }, data);
 
-        const countrySelect = page.locator('#NationalityAlphaCode');
-        let optionCount = 0;
-        for (let attempt = 0; attempt < 20; attempt += 1) {
-            optionCount = await countrySelect.evaluate((element) => element.options.length);
-            if (optionCount > 1) {
-                break;
+        // --- Country select via JS (avoids strict mode with duplicate IDs) ---
+        await page.waitForFunction(
+            () => {
+                const sel = document.querySelector('#NationalityAlphaCode');
+                return sel && sel.options.length > 1;
+            },
+            { timeout: 5000, polling: 100 },
+        ).catch(() => {});
+
+        const countryResult = await page.evaluate((countryNameLower) => {
+            const sel = document.querySelector('#NationalityAlphaCode');
+            if (!sel) return { selected: false, optionCount: 0 };
+
+            const optionCount = sel.options.length;
+            let targetValue = null;
+
+            // Try user's country
+            for (const opt of sel.options) {
+                if (opt.text.toLowerCase().includes(countryNameLower)) {
+                    targetValue = opt.value;
+                    break;
+                }
             }
-            await sleep(100);
-        }
 
-        fastify.log.info({ optionCount }, 'Opciones de país cargadas');
-
-        let countrySelected = false;
-        const countryName = data.country.toLowerCase();
-
-        try {
-            const targetValue = await countrySelect.evaluate((element, loweredCountryName) => {
-                for (const option of element.options) {
-                    if (option.text.toLowerCase().includes(loweredCountryName)) {
-                        return option.value;
+            // Fallback: chile
+            if (!targetValue) {
+                for (const opt of sel.options) {
+                    if (opt.text.toLowerCase().includes('chile')) {
+                        targetValue = opt.value;
+                        break;
                     }
                 }
-                return null;
-            }, countryName);
+            }
+
+            // Fallback: first non-empty
+            if (!targetValue) {
+                for (const opt of sel.options) {
+                    if (opt.value) {
+                        targetValue = opt.value;
+                        break;
+                    }
+                }
+            }
 
             if (targetValue) {
-                await countrySelect.selectOption({ value: targetValue });
-                countrySelected = true;
-                fastify.log.info({ targetValue }, 'País seleccionado');
+                sel.value = targetValue;
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                return { selected: true, targetValue, optionCount };
             }
-        } catch (error) {
-            fastify.log.warn({ err: error }, 'Error seleccionando país');
-        }
 
-        if (!countrySelected) {
-            try {
-                const fallbackValue = await countrySelect.evaluate((element) => {
-                    for (const option of element.options) {
-                        if (option.text.toLowerCase().includes('chile')) {
-                            return option.value;
-                        }
-                    }
+            return { selected: false, optionCount };
+        }, data.country.toLowerCase());
 
-                    for (const option of element.options) {
-                        if (option.value) {
-                            return option.value;
-                        }
-                    }
-
-                    return null;
-                });
-
-                if (fallbackValue) {
-                    await countrySelect.selectOption({ value: fallbackValue });
-                    fastify.log.info({ fallbackValue }, 'Fallback de país aplicado');
-                }
-            } catch (error) {
-                fastify.log.warn({ err: error }, 'Fallback de país falló');
-            }
-        }
+        fastify.log.info(countryResult, 'País procesado');
 
         let playerName = null;
 
+        // --- Enable and click verify button via JS ---
         await page.evaluate(() => {
-            const buttons = document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify');
-            buttons.forEach((button) => button.removeAttribute('disabled'));
+            document.querySelectorAll('#btn-verify, #btn-verify-account, .btn-verify')
+                .forEach((btn) => btn.removeAttribute('disabled'));
         });
 
-        const verifyBtn = page.locator(
-            '#btn-verify, button:has-text("Verificar ID"), button:has-text("Verify ID"), button:has-text("Verificar Id"), #btn-verify-account',
-        ).first();
+        const hasVerifyBtn = await page.evaluate(
+            () => Boolean(document.querySelector('#btn-verify, #btn-verify-account, .btn-verify')),
+        );
 
-        if (await verifyBtn.count() > 0) {
+        if (hasVerifyBtn) {
             try {
                 const accountResponsePromise = page.waitForResponse(
                     (response) => response.url().includes('validate/account'),
-                    { timeout: TIMEOUT_MS },
+                    { timeout: 10_000 },
                 );
-                await verifyBtn.click({ timeout: 5000 });
+                await page.evaluate(() => {
+                    const btn = document.querySelector('#btn-verify') ||
+                        document.querySelector('#btn-verify-account') ||
+                        document.querySelector('.btn-verify');
+                    if (btn) btn.click();
+                });
                 const accountResponse = await accountResponsePromise;
                 const accountJson = await accountResponse.json();
 
@@ -480,75 +484,53 @@ async function automateRedeem(data) {
             } catch (error) {
                 fastify.log.warn({ err: error }, 'No se pudo procesar validate/account');
             }
-
-            await sleep(100);
         } else {
             fastify.log.warn('Botón Verificar ID no encontrado, continuando');
         }
 
+        // --- Check all checkboxes via JS ---
         await page.evaluate(() => {
-            document.querySelectorAll('input[type="checkbox"]').forEach((checkbox) => {
-                checkbox.checked = false;
+            document.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+                cb.checked = true;
+                cb.dispatchEvent(new Event('change', { bubbles: true }));
+                cb.dispatchEvent(new Event('input', { bubbles: true }));
             });
         });
 
-        const checkboxes = page.locator('input[type="checkbox"]');
-        const checkboxCount = await checkboxes.count();
-        for (let index = 0; index < checkboxCount; index += 1) {
-            const checkbox = checkboxes.nth(index);
-            let checkboxId = `idx${index}`;
-
-            try {
-                checkboxId = (await checkbox.getAttribute('id')) || checkboxId;
-                if (await checkbox.isVisible()) {
-                    await checkbox.click({ timeout: 3000 });
-                    continue;
-                }
-
-                const label = page.locator(`label[for="${checkboxId}"]`).first();
-                if (await label.count() > 0 && await label.isVisible()) {
-                    await label.click({ timeout: 3000 });
-                    continue;
-                }
-
-                await checkbox.evaluate((element) => element.click());
-            } catch (error) {
-                fastify.log.warn({ err: error, checkboxId }, 'No se pudo marcar checkbox');
-            }
-        }
-
-        await sleep(100);
-
+        // --- Clean overlays and prepare redeem button via JS ---
         await page.evaluate(() => {
             document.querySelectorAll(
                 '[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"], ' +
                 '[class*="Cookie"], [class*="Consent"], .cc-window, .cc-banner, #onetrust-banner-sdk',
-            ).forEach((element) => element.remove());
+            ).forEach((el) => el.remove());
 
-            document.querySelectorAll('[class*="overlay"], [class*="backdrop"], [class*="modal"]').forEach((element) => {
-                if (element.id !== 'btn-redeem' && !element.closest('.card')) {
-                    element.remove();
+            document.querySelectorAll('[class*="overlay"], [class*="backdrop"], [class*="modal"]').forEach((el) => {
+                if (el.id !== 'btn-redeem' && !el.closest('.card')) {
+                    el.remove();
                 }
             });
 
-            const button = document.querySelector('#btn-redeem');
-            if (button) {
-                button.removeAttribute('disabled');
-            }
+            const btn = document.querySelector('#btn-redeem');
+            if (btn) btn.removeAttribute('disabled');
         });
 
         const urlBefore = page.url();
         let confirmOk = false;
         let confirmBody = '';
 
-        const redeemBtn = page.locator('#btn-redeem').first();
-        if (await redeemBtn.count() > 0 && await redeemBtn.isVisible()) {
+        // --- Attempt 1: Click redeem via JS ---
+        const hasRedeemBtn = await page.evaluate(() => {
+            const btn = document.querySelector('#btn-redeem');
+            return Boolean(btn);
+        });
+
+        if (hasRedeemBtn) {
             try {
                 const confirmResponsePromise = page.waitForResponse(
                     (response) => response.url().includes('/confirm'),
                     { timeout: 10_000 },
                 );
-                await redeemBtn.click({ timeout: 5000 });
+                await page.evaluate(() => document.querySelector('#btn-redeem').click());
                 const confirmResponse = await confirmResponsePromise;
                 confirmBody = await confirmResponse.text().catch(() => '');
                 if (confirmResponse.status() < 400) {
@@ -703,8 +685,6 @@ async function automateRedeem(data) {
                 details: 'Ambos intentos principales de submit fallaron',
             };
         }
-
-        await sleep(100);
 
         const urlAfter = page.url();
         fastify.log.info({ urlBefore, urlAfter, changed: urlAfter !== urlBefore }, 'Estado de URL tras submit');
