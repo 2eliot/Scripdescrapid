@@ -74,6 +74,10 @@ const idempotencyCache = new Map();
 let processCpuUsage = process.cpuUsage();
 let processHrtime = process.hrtime.bigint();
 
+// --- Page Pool ---
+const pagePool = [];        // Array of { context, page, ready: boolean }
+let poolFilling = false;
+
 class Semaphore {
     constructor(max) {
         this.max = max;
@@ -174,6 +178,143 @@ async function ensureBrowser() {
     }
 }
 
+// --- Page Pool: create a pre-warmed page ---
+async function createWarmedPage() {
+    const currentBrowser = await ensureBrowser();
+    const context = await currentBrowser.newContext({
+        viewport: { width: 1024, height: 600 },
+        locale: 'pt-BR',
+    });
+
+    await context.route('**/*', async (route) => {
+        const request = route.request();
+        const resourceType = request.resourceType();
+        const url = request.url();
+
+        if (['image', 'font', 'media'].includes(resourceType) || BLOCKED_DOMAINS.some((domain) => url.includes(domain))) {
+            await route.abort();
+            return;
+        }
+
+        await route.continue();
+    });
+
+    const page = await context.newPage();
+    await page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
+    await page.waitForSelector('#pininput', { state: 'visible', timeout: TIMEOUT_MS });
+
+    // Dismiss cookies
+    await page.evaluate(() => {
+        const selectors = [
+            'button[id*="accept"]', 'button[id*="Accept"]',
+            'a[id*="accept"]', 'a[id*="Accept"]',
+            '.cc-accept', '.cc-dismiss', 'button.accept-cookies',
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) { el.click(); return; }
+        }
+        const buttons = document.querySelectorAll('button, a.btn, a[role="button"]');
+        for (const btn of buttons) {
+            const t = btn.textContent.trim().toLowerCase();
+            if (['aceptar','accept','aceitar','accept all','aceptar todo','aceptar todas'].includes(t)) {
+                btn.click(); return;
+            }
+        }
+        document.querySelectorAll('[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]')
+            .forEach((el) => el.remove());
+    }).catch(() => {});
+
+    // Wait for reCAPTCHA (up to 3s)
+    for (let i = 0; i < 20; i += 1) {
+        const ready = await page.evaluate(
+            () => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function',
+        );
+        if (ready) break;
+        await sleep(150);
+    }
+
+    return { context, page, ready: true };
+}
+
+// --- Fill the pool up to MAX_CONCURRENT ---
+async function fillPool() {
+    if (poolFilling) return;
+    poolFilling = true;
+
+    try {
+        while (pagePool.length < MAX_CONCURRENT) {
+            try {
+                const entry = await createWarmedPage();
+                pagePool.push(entry);
+                fastify.log.info({ poolSize: pagePool.length }, 'Página pre-calentada añadida al pool');
+            } catch (error) {
+                fastify.log.warn({ err: error }, 'Error creando página pre-calentada');
+                break;
+            }
+        }
+    } finally {
+        poolFilling = false;
+    }
+}
+
+// --- Take a page from pool (or create one on demand) ---
+async function acquirePage() {
+    let entry = pagePool.shift();
+
+    if (entry) {
+        // Verify page is still alive
+        try {
+            await entry.page.evaluate(() => true);
+            return entry;
+        } catch {
+            // Page died, close and fall through to create new
+            try { await entry.context.close(); } catch {}
+        }
+    }
+
+    // No pooled page available, create one on demand
+    return createWarmedPage();
+}
+
+// --- Return a page to the pool by reloading it in background ---
+function recyclePage(entry) {
+    // Fire and forget: reload the page and put back in pool
+    (async () => {
+        try {
+            await entry.page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
+            await entry.page.waitForSelector('#pininput', { state: 'visible', timeout: TIMEOUT_MS });
+
+            // Dismiss cookies again
+            await entry.page.evaluate(() => {
+                document.querySelectorAll('[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]')
+                    .forEach((el) => el.remove());
+            }).catch(() => {});
+
+            // Wait reCAPTCHA
+            for (let i = 0; i < 20; i += 1) {
+                const ready = await entry.page.evaluate(
+                    () => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function',
+                );
+                if (ready) break;
+                await sleep(150);
+            }
+
+            if (pagePool.length < MAX_CONCURRENT) {
+                pagePool.push(entry);
+                fastify.log.info({ poolSize: pagePool.length }, 'Página reciclada al pool');
+            } else {
+                await entry.context.close();
+            }
+        } catch (error) {
+            fastify.log.warn({ err: error }, 'Error reciclando página, descartada');
+            try { await entry.context.close(); } catch {}
+            // Replenish pool
+            fillPool().catch(() => {});
+        }
+    })();
+}
+
 function getCachedResult(requestId) {
     if (!requestId || !idempotencyCache.has(requestId)) {
         return null;
@@ -215,89 +356,13 @@ function getCpuPercent() {
 
 async function automateRedeem(data) {
     const startedAt = Date.now();
-    let context;
+    let entry;
+    let shouldRecycle = false;
 
     try {
-        const currentBrowser = await ensureBrowser();
-        context = await currentBrowser.newContext({
-            viewport: { width: 1024, height: 600 },
-            locale: 'pt-BR',
-        });
-
-        await context.route('**/*', async (route) => {
-            const request = route.request();
-            const resourceType = request.resourceType();
-            const url = request.url();
-
-            if (['image', 'font', 'media'].includes(resourceType) || BLOCKED_DOMAINS.some((domain) => url.includes(domain))) {
-                await route.abort();
-                return;
-            }
-
-            await route.continue();
-        });
-
-        const page = await context.newPage();
-
-        fastify.log.info({ url: REDEEM_URL }, 'Navegando a Hype Games');
-        await page.goto(REDEEM_URL, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
-        await page.waitForSelector('#pininput', { state: 'visible', timeout: TIMEOUT_MS });
-        fastify.log.info({ elapsedMs: Date.now() - startedAt }, 'Página lista');
-
-        try {
-            const cookieDismissed = await page.evaluate(() => {
-                const selectors = [
-                    'button[id*="accept"]', 'button[id*="Accept"]',
-                    'a[id*="accept"]', 'a[id*="Accept"]',
-                    '.cc-accept', '.cc-dismiss',
-                    'button.accept-cookies',
-                ];
-                for (const selector of selectors) {
-                    const element = document.querySelector(selector);
-                    if (element) {
-                        element.click();
-                        return `clicked:${selector}`;
-                    }
-                }
-
-                const buttons = document.querySelectorAll('button, a.btn, a[role="button"]');
-                for (const button of buttons) {
-                    const text = button.textContent.trim().toLowerCase();
-                    if (
-                        text === 'aceptar' ||
-                        text === 'accept' ||
-                        text === 'aceitar' ||
-                        text === 'accept all' ||
-                        text === 'aceptar todo' ||
-                        text === 'aceptar todas'
-                    ) {
-                        button.click();
-                        return `clicked_text:${text}`;
-                    }
-                }
-
-                document
-                    .querySelectorAll('[class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]')
-                    .forEach((element) => element.remove());
-
-                return 'no_btn_found_overlays_removed';
-            });
-            fastify.log.info({ cookieDismissed }, 'Cookie popup procesado');
-        } catch (error) {
-            fastify.log.warn({ err: error }, 'Cookie popup dismiss falló');
-        }
-
-        let recaptchaReady = false;
-        for (let attempt = 0; attempt < 20; attempt += 1) {
-            recaptchaReady = await page.evaluate(
-                () => typeof window.grecaptcha !== 'undefined' && typeof window.grecaptcha.execute === 'function',
-            );
-            if (recaptchaReady) {
-                break;
-            }
-            await sleep(150);
-        }
-        fastify.log.info({ recaptchaReady }, 'Estado de reCAPTCHA');
+        entry = await acquirePage();
+        const { page } = entry;
+        fastify.log.info({ elapsedMs: Date.now() - startedAt }, 'Página obtenida del pool');
 
         // --- PIN input via JS ---
         await page.waitForSelector('#pininput', { state: 'visible', timeout: TIMEOUT_MS });
@@ -346,6 +411,7 @@ async function automateRedeem(data) {
 
         const pinKeyword = PIN_ERROR_KEYWORDS.find((keyword) => lowerText.includes(keyword.toLowerCase()));
         if (pinKeyword) {
+            shouldRecycle = true;
             return {
                 success: false,
                 message: 'Error de PIN',
@@ -361,6 +427,7 @@ async function automateRedeem(data) {
 
         if (!cardBackHtml || !cardBackHtml.includes('GameAccountId')) {
             if (!FORM_KEYWORDS.some((keyword) => lowerText.includes(keyword))) {
+                shouldRecycle = true;
                 return {
                     success: false,
                     message: 'Formulario no apareció después de validar PIN',
@@ -475,6 +542,7 @@ async function automateRedeem(data) {
                 if (accountJson.Success) {
                     playerName = accountJson.Username || null;
                 } else {
+                    shouldRecycle = true;
                     return {
                         success: false,
                         message: 'Error de ID del jugador',
@@ -678,6 +746,7 @@ async function automateRedeem(data) {
         }
 
         if (!confirmOk && !confirmBody) {
+            shouldRecycle = true;
             return {
                 success: false,
                 message: 'No se pudo enviar el formulario de canje',
@@ -685,6 +754,9 @@ async function automateRedeem(data) {
                 details: 'Ambos intentos principales de submit fallaron',
             };
         }
+
+        // All post-submit paths can recycle the page
+        shouldRecycle = true;
 
         const urlAfter = page.url();
         fastify.log.info({ urlBefore, urlAfter, changed: urlAfter !== urlBefore }, 'Estado de URL tras submit');
@@ -760,10 +832,13 @@ async function automateRedeem(data) {
             details: error.message,
         };
     } finally {
-        if (context) {
-            try {
-                await context.close();
-            } catch {}
+        if (entry) {
+            if (shouldRecycle) {
+                recyclePage(entry);
+            } else {
+                try { await entry.context.close(); } catch {}
+                fillPool().catch(() => {});
+            }
         }
 
         fastify.log.info({ elapsedMs: Date.now() - startedAt }, 'Canje completado');
@@ -816,6 +891,7 @@ fastify.post('/redeem', { schema: { body: redeemBodySchema } }, async (request) 
 fastify.get('/health', async () => ({
     status: 'ok',
     browser_ready: getBrowserReady(),
+    pool_size: pagePool.length,
 }));
 
 fastify.get('/metrics', async () => {
@@ -832,16 +908,25 @@ fastify.get('/metrics', async () => {
         max_concurrent: MAX_CONCURRENT,
         total_redeems: totalRedeems,
         idempotency_cache_size: idempotencyCache.size,
+        pool_size: pagePool.length,
     };
 });
 
 fastify.addHook('onClose', async () => {
+    // Close all pooled pages
+    for (const entry of pagePool) {
+        try { await entry.context.close(); } catch {}
+    }
+    pagePool.length = 0;
     await closeBrowser();
 });
 
 async function start() {
     try {
         await ensureBrowser();
+        // Pre-warm page pool
+        await fillPool();
+        fastify.log.info({ poolSize: pagePool.length }, 'Pool de páginas pre-calentadas listo');
         const port = Number.parseInt(process.env.PORT || '5000', 10);
         const host = process.env.HOST || '0.0.0.0';
         await fastify.listen({ port, host });
