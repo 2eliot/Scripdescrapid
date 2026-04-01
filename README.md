@@ -1,25 +1,37 @@
 # Hype Games PIN Redeemer API
 
-API FastAPI + Playwright que automatiza el canje de PINs en https://redeem.hype.games/client/en-US/redeem
+Migración a Node.js con Fastify + Playwright, manteniendo la lógica operativa de la versión Python y trasladando sus optimizaciones principales.
 
-## Instalación en VPS
+## Qué conserva la migración
+
+- Browser Chromium pre-lanzado y compartido.
+- Contexto fresco por request para evitar contaminación de sesión y problemas con reCAPTCHA.
+- Límite de concurrencia configurable con `MAX_CONCURRENT_REDEEMS`.
+- Cache de idempotencia por `request_id`.
+- Endpoints `POST /redeem`, `GET /health` y `GET /metrics`.
+- Bloqueo de recursos pesados y dominios de tracking para mejorar tiempos de respuesta.
+- Fallbacks de submit y verificación final equivalentes a la versión Python.
+
+## Instalación
 
 ```bash
-# 1. Instalar dependencias Python
-pip install -r requirements.txt
-
-# 2. Instalar navegador Chromium para Playwright
-playwright install chromium
-playwright install-deps   # solo en Linux, instala dependencias del sistema
+npm install
+npx playwright install chromium
 ```
 
 ## Ejecución
 
 ```bash
-python main.py
+npm start
 ```
 
-El servidor escucha en `0.0.0.0:5000`.
+Por defecto el servidor escucha en `0.0.0.0:5000`.
+
+Variables de entorno disponibles:
+
+- `PORT`: puerto HTTP. Default `5000`.
+- `HOST`: host de escucha. Default `0.0.0.0`.
+- `MAX_CONCURRENT_REDEEMS`: cantidad máxima de canjes simultáneos. Default `3`.
 
 ## Uso
 
@@ -33,41 +45,24 @@ curl -X POST http://localhost:5000/redeem \
     "full_name": "Juan Pérez",
     "birth_date": "15/03/1990",
     "player_id": "123456789",
-    "country": "Argentina"
+    "country": "Argentina",
+    "request_id": "pedido-001"
   }'
 ```
 
-### Respuesta exitosa
-
-```json
-{
-  "success": true,
-  "message": "PIN redeemed successfully",
-  "details": "successfully redeemed"
-}
-```
-
-### Respuesta con error
-
-```json
-{
-  "success": false,
-  "message": "PIN error",
-  "details": "The site returned an error related to: 'already been redeemed'"
-}
-```
-
 ### GET /health
-
-Verifica que el servidor y el navegador estén listos.
 
 ```bash
 curl http://localhost:5000/health
 ```
 
+### GET /metrics
+
+```bash
+curl http://localhost:5000/metrics
+```
+
 ## Notas
 
-- El navegador Chromium se pre-lanza al iniciar la app para respuestas rápidas (<5s).
-- Cada petición usa un contexto aislado (cookies/sesión independientes).
-- Los selectores CSS pueden necesitar ajuste si el sitio cambia su estructura HTML.
-- Si el sitio usa reCAPTCHA activamente, podría bloquear la automatización headless.
+- La única entrada soportada del servicio es `main.js`.
+- Si el sitio cambia selectores, estructura o la estrategia anti-bot, habrá que ajustar la automatización.
