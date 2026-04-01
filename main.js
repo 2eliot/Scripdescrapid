@@ -928,7 +928,7 @@ async function start() {
         // Pre-warm page pool
         await fillPool();
         fastify.log.info({ poolSize: pagePool.length }, 'Pool de páginas pre-calentadas listo');
-        const port = Number.parseInt(process.env.PORT || '5000', 10);
+        const port = Number.parseInt(process.env.PORT || '8000', 10);
         const host = process.env.HOST || '0.0.0.0';
         await fastify.listen({ port, host });
     } catch (error) {
